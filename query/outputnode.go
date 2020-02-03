@@ -32,6 +32,7 @@ import (
 
 	"github.com/dgraph-io/dgo/v2/protos/api"
 	"github.com/dgraph-io/dgraph/algo"
+	"github.com/dgraph-io/dgraph/codec"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/task"
 	"github.com/dgraph-io/dgraph/types"
@@ -520,7 +521,7 @@ func processNodeUids(fj *fastJsonNode, sg *SubGraph) error {
 		return nil
 	}
 
-	hasChild := handleCountUIDNodes(sg, fj, len(sg.DestUIDs.Uids))
+	hasChild := handleCountUIDNodes(sg, fj, int(sg.DestUIDs.NumUids()))
 	if sg.Params.IsGroupBy {
 		if len(sg.GroupbyRes) == 0 {
 			return errors.Errorf("Expected GroupbyRes to have length > 0.")
@@ -529,7 +530,8 @@ func processNodeUids(fj *fastJsonNode, sg *SubGraph) error {
 		return nil
 	}
 
-	lenList := len(sg.uidMatrix[0].Uids)
+	lenList := int(sg.uidMatrix[0].NumUids())
+	codec.Intersect(sg.uidMatrix[0], sg.DestUIDs)
 	for i := 0; i < lenList; i++ {
 		uid := sg.uidMatrix[0].Uids[i]
 		if algo.IndexOf(sg.DestUIDs, uid) < 0 {

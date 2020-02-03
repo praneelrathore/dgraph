@@ -29,6 +29,7 @@ import (
 	otrace "go.opencensus.io/trace"
 
 	"github.com/dgraph-io/dgraph/algo"
+	"github.com/dgraph-io/dgraph/codec"
 	"github.com/dgraph-io/dgraph/posting"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/schema"
@@ -187,7 +188,7 @@ func sortWithIndex(ctx context.Context, ts *pb.SortMessage) *sortresult {
 		out[i].offset = int(ts.Offset)
 		var emptyList pb.List
 		out[i].ulist = &emptyList
-		out[i].uset = map[uint64]struct{}{}
+		out[i].uset = codec.NewUIDSet(nil)
 	}
 
 	order := ts.Order[0]
@@ -527,7 +528,7 @@ type intersectedList struct {
 	offset          int
 	ulist           *pb.List
 	values          []types.Val
-	uset            map[uint64]struct{}
+	uset            *codec.UIDSet
 	multiSortOffset int32
 }
 
@@ -563,17 +564,18 @@ func intersectBucket(ctx context.Context, ts *pb.SortMessage, token string,
 
 		// Intersect index with i-th input UID list.
 		listOpt := posting.ListOptions{
-			Intersect: ul,
+			Intersect: codec.UIDSetFromList(ul),
 			ReadTs:    ts.ReadTs,
 		}
-		result, err := pl.Uids(listOpt) // The actual intersection work is done here.
+		intersection, err := pl.Uids(listOpt) // The actual intersection work is done here.
 		if err != nil {
 			return err
 		}
 
 		// Duplicates will exist between buckets if there are multiple language
 		// variants of a predicate.
-		result.Uids = removeDuplicates(result.Uids, il.uset)
+		removeDuplicates(intersection, il.uset)
+		result := &pb.List{Uids: intersection.ToUids()}
 
 		// Check offsets[i].
 		n := len(result.Uids)
@@ -646,18 +648,19 @@ func intersectBucket(ctx context.Context, ts *pb.SortMessage, token string,
 
 // removeDuplicates removes elements from uids if they are in set. It also adds
 // all uids to set.
-func removeDuplicates(uids []uint64, set map[uint64]struct{}) []uint64 {
-	for i := 0; i < len(uids); i++ {
-		uid := uids[i]
-		if _, ok := set[uid]; ok {
-			copy(uids[i:], uids[i+1:])
-			uids = uids[:len(uids)-1]
-			i-- // we just removed an entry, so go back one step
-		} else {
-			set[uid] = struct{}{}
+func removeDuplicates(uidSet, dedup *codec.UIDSet) {
+	uids := make([]uint64, 64)
+	uidSetIter := uidSet.NewIterator()
+	for numUids := uidSetIter.Next(uids); numUids > 0; numUids = uidSetIter.Next(uids) {
+		for i := 0; i < numUids; i++ {
+			uid := uids[i]
+			if dedup.Contains(uid) {
+				uidSet.RemoveOne(uid)
+			} else {
+				dedup.AddUID(uid)
+			}
 		}
 	}
-	return uids
 }
 
 func paginate(ts *pb.SortMessage, dest *pb.List, vals []types.Val) (int, int, error) {
