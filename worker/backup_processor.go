@@ -135,7 +135,8 @@ func (pr *BackupProcessor) WriteBackup(ctx context.Context) (*pb.Status, error) 
 			return false
 		}
 
-		// TODO: remove this after real fix is merged.
+		// Do not choose keys that contain parts of a multi-part list. These keys
+		// will be accessed from the main list.
 		if parsedKey.HasStartUid {
 			return false
 		}
