@@ -59,7 +59,7 @@ func ProcessRestoreRequest(ctx context.Context, req *pb.RestoreRequest) error {
 	for _, gid := range currentGroups {
 		reqCopy := proto.Clone(req).(*pb.RestoreRequest)
 		reqCopy.GroupId = gid
-		if err := proposeRestoreOrSend(cancelCtx, req); err != nil {
+		if err := proposeRestoreOrSend(cancelCtx, reqCopy); err != nil {
 			cancel()
 			return err
 		}
@@ -170,6 +170,8 @@ func handleRestoreProposal(ctx context.Context, req *pb.RestoreRequest) error {
 	if err := writeBackup(ctx, req); err != nil {
 		return errors.Wrapf(err, "cannot write backup")
 	}
+
+	// TODO: load schema.
 
 	// Propose a snapshot immediately after all the work is done to prevent the restore
 	// from being replayed.
