@@ -77,7 +77,8 @@ func RunRestore(pdir, location, backupId string) LoadResult {
 // values from predicates no longer assigned to this group.
 // If ts is greater than zero, the key-value pairs will be written with that timestamp.
 // Otherwise, the original value is used.
-func loadFromBackup(db *badger.DB, r io.Reader, ts uint64, preds predicateSet) (uint64, error) {
+func loadFromBackup(db *badger.DB, r io.Reader, restoreTs uint64, preds predicateSet) (
+	uint64, error) {
 	br := bufio.NewReaderSize(r, 16<<10)
 	unmarshalBuf := make([]byte, 1<<10)
 
@@ -133,8 +134,8 @@ func loadFromBackup(db *badger.DB, r io.Reader, ts uint64, preds predicateSet) (
 			}
 
 			// Override the version if requested.
-			if ts > 0 {
-				kv.Version = ts
+			if restoreTs > 0 {
+				kv.Version = restoreTs
 			}
 
 			switch kv.GetUserMeta()[0] {
@@ -179,6 +180,9 @@ func loadFromBackup(db *badger.DB, r io.Reader, ts uint64, preds predicateSet) (
 				}
 
 			case posting.BitSchemaPosting:
+				// Schema and type keys should always have a timestamp equal to 1.
+				kv.Version = 1
+
 				// Schema and type keys are not stored in an intermediate format so their
 				// value can be written as is.
 				kv.Key = restoreKey

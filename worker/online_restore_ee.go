@@ -21,6 +21,7 @@ import (
 	"github.com/dgraph-io/dgraph/conn"
 	"github.com/dgraph-io/dgraph/posting"
 	"github.com/dgraph-io/dgraph/protos/pb"
+	"github.com/dgraph-io/dgraph/schema"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/pkg/errors"
@@ -125,16 +126,8 @@ func handleRestoreProposal(ctx context.Context, req *pb.RestoreRequest) error {
 		return err
 	}
 
-	// // Remove current tablets.
-	// if err := UpdateMembershipState(ctx); err != nil {
-	// 	return errors.Errorf("cannot update membership state")
-	// }
-	// ms := GetMembershipState()
-	// if gs, ok := ms.GetGroups()[req.GroupId]; ok {
-	// 	for _, tablet := range gs.GetTablets() {
-	// 		// TODO: how to correctly delete the tablet?
-	// 	}
-	// }
+	// TODO: after the drop, the tablets for the predicates stored in this group's
+	// backup could be in a different group. The tablets need to be moved.
 
 	// Reset tablets and set correct tablets to match the restored backup.
 	creds := &Credentials{
@@ -171,11 +164,13 @@ func handleRestoreProposal(ctx context.Context, req *pb.RestoreRequest) error {
 		return errors.Wrapf(err, "cannot write backup")
 	}
 
-	// TODO: load schema.
+	// Load schema back.
+	if err := schema.LoadFromDb(); err != nil {
+		return errors.Wrapf(err, "cannot load schema after restore")
+	}
 
 	// Propose a snapshot immediately after all the work is done to prevent the restore
 	// from being replayed.
-	// TODO: is this enough to successfully trigger the snapshot?
 	if err := groups().Node.proposeSnapshot(0); err != nil {
 		return err
 	}
