@@ -23,7 +23,7 @@ mkdir $GOPATH
 PATH="$GOPATH/bin:$PATH"
 
 # The Go version used for release builds must match this version.
-GOVERSION="1.13.5"
+GOVERSION="1.14.1"
 
 # Turn off go modules by default. Only enable go modules when needed.
 export GO111MODULE=off
@@ -81,7 +81,7 @@ popd
 basedir=$GOPATH/src/github.com/dgraph-io
 # Clone Dgraph repo.
 pushd $basedir
-  git clone https://github.com/dgraph-io/dgraph.git
+  git clone /home/dmai/go/src/github.com/dgraph-io/dgraph
 popd
 
 pushd $basedir/dgraph
@@ -94,14 +94,6 @@ pushd $basedir/dgraph
   release_version=$(git describe --always --tags)
 popd
 
-# Regenerate protos. Should not be different from what's checked in.
-pushd $basedir/dgraph/protos
-  make regenerate
-  if [[ "$(git status --porcelain)" ]]; then
-      echo >&2 "Generated protos different in release."
-      exit 1
-  fi
-popd
 
 # Clone ratel repo.
 pushd $basedir
@@ -113,49 +105,47 @@ pushd $basedir/ratel
   source ~/.nvm/nvm.sh
   nvm install --lts
   ./scripts/build.prod.sh
-  ./scripts/test.sh
+  #./scripts/test.sh
 popd
 
 # Build Windows.
 pushd $basedir/dgraph/dgraph
-  env GOOS=windows GOARCH=amd64 go get -v -d .
-  env GOOS=windows GOARCH=amd64 GO111MODULE=on go build -v -o dgraph-windows-amd64.exe -ldflags \
+  env CGO_ENABLED=1 GO111MODULE=on xgo -go=$GOVERSION --targets=windows/amd64 -ldflags \
       "-X $release=$release_version -X $branch=$gitBranch -X $commitSHA1=$lastCommitSHA1 -X '$commitTime=$lastCommitTime'" .
   mkdir $TMP/windows
-  mv dgraph-windows-amd64.exe $TMP/windows/dgraph.exe
+  mv dgraph-windows-4.0-amd64.exe $TMP/windows/dgraph.exe
 popd
 
 pushd $basedir/badger/badger
-  env GOOS=windows GOARCH=amd64 go get -v -d .
-  env GOOS=windows GOARCH=amd64 GO111MODULE=on go build -v -o badger-windows-amd64.exe .
-  mv badger-windows-amd64.exe $TMP/windows/badger.exe
+  #env GOOS=windows GOARCH=amd64 go get -v -d .
+  #env CGO_ENABLED=1 GOOS=windows GOARCH=amd64 GO111MODULE=on go build -v -o badger-windows-amd64.exe .
+  env CGO_ENABLED=1 GO111MODULE=on xgo -go=$GOVERSION --targets=windows/amd64 .
+  mv badger-windows-4.0-amd64.exe $TMP/windows/badger.exe
 popd
 
 pushd $basedir/ratel
-  env GOOS=windows GOARCH=amd64 go get -v -d .
-  env GOOS=windows GOARCH=amd64 go build -v -o ratel-windows-amd64.exe -ldflags "-X $ratel_release=$release_version" .
-  mv ratel-windows-amd64.exe $TMP/windows/dgraph-ratel.exe
+  #env GOOS=windows GOARCH=amd64 go get -v -d .
+  #env CGO_ENABLED=1 GOOS=windows GOARCH=amd64 go build -v -o ratel-windows-amd64.exe -ldflags "-X $ratel_release=$release_version" .
+  env CGO_ENABLED=1 GO111MODULE=on xgo -go=$GOVERSION --targets=windows/amd64 -ldflags "-X $ratel_release=$release_version" .
+  mv ratel-windows-4.0-amd64.exe $TMP/windows/dgraph-ratel.exe
 popd
 
 # Build Darwin.
 pushd $basedir/dgraph/dgraph
-  env GOOS=darwin GOARCH=amd64 go get -v -d .
-  env GOOS=darwin GOARCH=amd64 GO111MODULE=on go build -v -o dgraph-darwin-amd64 -ldflags \
-      "-X $release=$release_version -X $branch=$gitBranch -X $commitSHA1=$lastCommitSHA1 -X '$commitTime=$lastCommitTime'" .
+  env CGO_ENABLED=1 GO111MODULE=on xgo -go=$GOVERSION --targets=darwin-10.9/amd64 -ldflags \
+  "-X $release=$release_version -X $branch=$gitBranch -X $commitSHA1=$lastCommitSHA1 -X '$commitTime=$lastCommitTime'" .
   mkdir $TMP/darwin
-  mv dgraph-darwin-amd64 $TMP/darwin/dgraph
+  mv dgraph-darwin-10.9-amd64 $TMP/darwin/dgraph
 popd
 
 pushd $basedir/badger/badger
-  env GOOS=darwin GOARCH=amd64 go get -v -d .
-  env GOOS=darwin GOARCH=amd64 GO111MODULE=on go build -v -o badger-darwin-amd64 .
-  mv badger-darwin-amd64 $TMP/darwin/badger
+  xgo -go=$GOVERSION --targets=darwin-10.9/amd64 .
+  mv badger-darwin-10.9-amd64 $TMP/darwin/badger
 popd
 
 pushd $basedir/ratel
-  env GOOS=darwin GOARCH=amd64 go get -v -d .
-  env GOOS=darwin GOARCH=amd64 go build -v -o ratel-darwin-amd64 -v -ldflags "-X $ratel_release=$release_version" .
-  mv ratel-darwin-amd64 $TMP/darwin/dgraph-ratel
+  env CGO_ENABLED=1 xgo -go=$GOVERSION --targets=darwin-10.9/amd64 -ldflags "-X $ratel_release=$release_version" .
+  mv ratel-darwin-10.9-amd64 $TMP/darwin/dgraph-ratel
 popd
 
 # Build Linux.
