@@ -40,8 +40,8 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
-	"github.com/dgraph-io/dgo/v2"
-	"github.com/dgraph-io/dgo/v2/protos/api"
+	"github.com/dgraph-io/dgo/v200"
+	"github.com/dgraph-io/dgo/v200/protos/api"
 	"github.com/dgraph-io/dgraph/chunker"
 	"github.com/dgraph-io/dgraph/conn"
 	"github.com/dgraph-io/dgraph/dgraph/cmd/zero"
@@ -764,6 +764,9 @@ func (s *Server) Query(ctx context.Context, req *api.Request) (*api.Response, er
 
 func (s *Server) doQuery(ctx context.Context, req *api.Request, doAuth AuthMode) (
 	resp *api.Response, rerr error) {
+	if glog.V(3) {
+		glog.Infof("Got a query: %+v", req)
+	}
 	isGraphQL, _ := ctx.Value(IsGraphql).(bool)
 	if isGraphQL {
 		atomic.AddUint64(&numGraphQL, 1)
@@ -984,6 +987,11 @@ func processQuery(ctx context.Context, qc *queryContext) (*api.Response, error) 
 	resp.Metrics = &api.Metrics{
 		NumUids: er.Metrics,
 	}
+	var total uint64
+	for _, num := range resp.Metrics.NumUids {
+		total += num
+	}
+	resp.Metrics.NumUids["_total"] = total
 
 	return resp, err
 }
