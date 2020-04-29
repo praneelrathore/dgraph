@@ -212,7 +212,7 @@ wal=/path/to/w
 Dgraph is a truly distributed graph database - not a master-slave replication of
 universal dataset. It shards by predicate and replicates predicates across the
 cluster, queries can be run on any node and joins are handled over the
-distributed data.  A query is resolved locally for predicates the node stores,
+distributed data.  A query is resolved locally for predicates that the node stores,
 and via distributed joins for predicates stored on other nodes.
 
 For effectively running a Dgraph cluster, it's important to understand how
@@ -244,7 +244,7 @@ groups and move them to the new node.
 If `--replicas` flag is set to something greater than one, Zero would assign the
 same group to multiple nodes. These nodes would then form a Raft group aka
 quorum. Every write would be consistently replicated to the quorum. To achieve
-consensus, its important that the size of quorum be an odd number. Therefore, we
+consensus, it is important that the size of quorum be an odd number. Therefore, we
 recommend setting `--replicas` to 1, 3 or 5 (not 2 or 4). This allows 0, 1, or 2
 nodes serving the same group to be down, respectively without affecting the
 overall health of that group.
