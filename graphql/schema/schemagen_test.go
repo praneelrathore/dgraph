@@ -25,6 +25,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
 	"github.com/vektah/gqlparser/v2/gqlerror"
+	_ "github.com/vektah/gqlparser/v2/validator/rules"
 	"gopkg.in/yaml.v2"
 )
 
@@ -38,7 +39,7 @@ type TestCase struct {
 }
 
 func TestDGSchemaGen(t *testing.T) {
-	fileName := "schemagen_test.yml"
+	fileName := "dgraph_schemagen_test.yml"
 	byts, err := ioutil.ReadFile(fileName)
 	require.NoError(t, err, "Unable to read file %s", fileName)
 
@@ -89,7 +90,6 @@ func TestSchemaString(t *testing.T) {
 			outputFileName := outputDir + testFile.Name()
 			str2, err := ioutil.ReadFile(outputFileName)
 			require.NoError(t, err)
-
 			if diff := cmp.Diff(string(str2), newSchemaStr); diff != "" {
 				// fmt.Printf("Generated Schema (%s):\n%s\n", testFile.Name(), newSchemaStr)
 				t.Errorf("schema mismatch - diff (-want +got):\n%s", diff)
@@ -110,8 +110,13 @@ func TestSchemas(t *testing.T) {
 	t.Run("Valid Schemas", func(t *testing.T) {
 		for _, sch := range tests["valid_schemas"] {
 			t.Run(sch.Name, func(t *testing.T) {
-				_, errlist := NewHandler(sch.Input)
+				schHandler, errlist := NewHandler(sch.Input)
 				require.NoError(t, errlist, sch.Name)
+
+				newSchemaStr := schHandler.GQLSchema()
+
+				_, err = FromString(newSchemaStr)
+				require.NoError(t, err)
 			})
 		}
 	})

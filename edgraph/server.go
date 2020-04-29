@@ -45,6 +45,7 @@ import (
 	"github.com/dgraph-io/dgraph/chunker"
 	"github.com/dgraph-io/dgraph/conn"
 	"github.com/dgraph-io/dgraph/dgraph/cmd/zero"
+	"github.com/dgraph-io/dgraph/ee"
 	"github.com/dgraph-io/dgraph/gql"
 	"github.com/dgraph-io/dgraph/posting"
 	"github.com/dgraph-io/dgraph/protos/pb"
@@ -66,7 +67,8 @@ const (
 type GraphqlContextKey int
 
 const (
-	// IsGraphql is used to validate requests which are allowed to mutate dgraph.graphql.schema.
+	// IsGraphql is used to validate requests which are allowed to mutate GraphQL reserved
+	// predicates, like dgraph.graphql.schema and dgraph.graphql.xid.
 	IsGraphql GraphqlContextKey = iota
 	// Authorize is used to set if the request requires validation.
 	Authorize
@@ -710,15 +712,16 @@ func (s *Server) Health(ctx context.Context, all bool) (*api.Response, error) {
 	}
 	// Append self.
 	healthAll = append(healthAll, pb.HealthInfo{
-		Instance: "alpha",
-		Address:  x.WorkerConfig.MyAddr,
-		Status:   "healthy",
-		Group:    strconv.Itoa(int(worker.GroupId())),
-		Version:  x.Version(),
-		Uptime:   int64(time.Since(x.WorkerConfig.StartTime) / time.Second),
-		LastEcho: time.Now().Unix(),
-		Ongoing:  worker.GetOngoingTasks(),
-		Indexing: schema.GetIndexingPredicates(),
+		Instance:   "alpha",
+		Address:    x.WorkerConfig.MyAddr,
+		Status:     "healthy",
+		Group:      strconv.Itoa(int(worker.GroupId())),
+		Version:    x.Version(),
+		Uptime:     int64(time.Since(x.WorkerConfig.StartTime) / time.Second),
+		LastEcho:   time.Now().Unix(),
+		Ongoing:    worker.GetOngoingTasks(),
+		Indexing:   schema.GetIndexingPredicates(),
+		EeFeatures: ee.GetEEFeaturesList(),
 	})
 
 	var err error

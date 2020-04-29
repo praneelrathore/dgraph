@@ -34,11 +34,33 @@ enum DgraphIndex {
 	hour
 }
 
+enum HTTPMethod {
+	GET
+	POST
+	PUT
+	PATCH
+	DELETE
+}
+
+input CustomHTTP {
+	url: String!
+	method: HTTPMethod!
+	body: String!
+	forwardHeaders: [String!]
+}
+
+input CustomGraphQL {
+	query: String!
+}
+
 directive @hasInverse(field: String!) on FIELD_DEFINITION
 directive @search(by: [DgraphIndex!]) on FIELD_DEFINITION
 directive @dgraph(type: String, pred: String) on OBJECT | INTERFACE | FIELD_DEFINITION
 directive @id on FIELD_DEFINITION
 directive @secret(field: String!, pred: String) on OBJECT | INTERFACE
+directive @custom(http: CustomHTTP, graphql: CustomGraphQL) on FIELD_DEFINITION
+directive @remote on OBJECT | INTERFACE
+
 
 input IntFilter {
 	eq: Int
@@ -125,10 +147,6 @@ type UpdatePostPayload {
 }
 
 #######################
-# Generated Enums
-#######################
-
-#######################
 # Generated Inputs
 #######################
 
@@ -202,4 +220,15 @@ type Mutation {
 	addAuthor(input: [AddAuthorInput!]!): AddAuthorPayload
 	updateAuthor(input: UpdateAuthorInput!): UpdateAuthorPayload
 	deleteAuthor(filter: AuthorFilter!): DeleteAuthorPayload
+}
+
+#######################
+# Generated Subscriptions
+#######################
+
+type Subscription {
+	getPost(id: ID!): Post
+	queryPost(filter: PostFilter, first: Int, offset: Int): [Post]
+	getAuthor(id: ID!): Author
+	queryAuthor(filter: AuthorFilter, first: Int, offset: Int): [Author]
 }
