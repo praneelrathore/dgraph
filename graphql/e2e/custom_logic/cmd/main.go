@@ -17,15 +17,21 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"os/exec"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+
+	graphql "github.com/graph-gophers/graphql-go"
+	"github.com/graph-gophers/graphql-go/relay"
+	"gopkg.in/yaml.v2"
 )
 
 type expectedRequest struct {
@@ -36,6 +42,82 @@ type expectedRequest struct {
 	// Provide nil value for a key just to ensure that the key exists in request headers.
 	// Provide both key and value to ensure that key exists with given value
 	headers map[string][]string
+}
+
+type GraphqlRequest struct {
+	Query         string          `json:"query"`
+	OperationName string          `json:"operationName"`
+	Variables     json.RawMessage `json:"variables"`
+}
+type graphqlResponseObject struct {
+	Response  string
+	Schema    string
+	Name      string
+	Request   string
+	Variables string
+}
+
+var graphqlResponses map[string]graphqlResponseObject
+
+func init() {
+	b, err := ioutil.ReadFile("graphqlresponse.yaml")
+	if err != nil {
+		panic(err)
+	}
+	resps := []graphqlResponseObject{}
+
+	err = yaml.Unmarshal(b, &resps)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	graphqlResponses = make(map[string]graphqlResponseObject)
+
+	for _, resp := range resps {
+		graphqlResponses[resp.Name] = resp
+	}
+}
+
+func generateIntrospectionResult(schema string) string {
+	cmd := exec.Command("node", "index.js", schema)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		log.Fatal(err)
+	}
+	b, err := ioutil.ReadAll(stdout)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return string(b)
+}
+
+func commonGraphqlHandler(handlerName string) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		// return introspection json if it's introspection request.
+		if strings.Contains(string(body), "__schema") {
+			check2(fmt.Fprint(w,
+				generateIntrospectionResult(graphqlResponses[handlerName].Schema)))
+			return
+		}
+		// Parse the given graphql request.
+		req := &GraphqlRequest{}
+		err = json.Unmarshal(body, req)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if req.Query == strings.TrimSpace(graphqlResponses[handlerName].Request) && string(req.Variables) == strings.TrimSpace(graphqlResponses[handlerName].Variables) {
+			fmt.Fprintf(w, graphqlResponses[handlerName].Response)
+			return
+		}
+	}
 }
 
 type expectedGraphqlRequest struct {
@@ -54,6 +136,37 @@ func getError(key, val string) error {
 	return fmt.Errorf(`{ "errors": [{"message": "%s: %s"}] }`, key, val)
 }
 
+func compareHeaders(headers map[string][]string, actual http.Header) error {
+	if headers == nil {
+		return nil
+	}
+	actualHeaderLen := len(actual)
+	expectedHeaderLen := len(headers)
+	if actualHeaderLen != expectedHeaderLen {
+		return getError(fmt.Sprintf("Wanted %d headers in request, got", expectedHeaderLen),
+			strconv.Itoa(actualHeaderLen))
+	}
+
+	for k, v := range headers {
+		rv, ok := actual[k]
+		if !ok {
+			return getError("Required header not found", k)
+		}
+
+		if v == nil {
+			continue
+		}
+
+		sort.Strings(rv)
+		sort.Strings(v)
+
+		if !reflect.DeepEqual(rv, v) {
+			return getError(fmt.Sprintf("Unexpected value for %s header", k), fmt.Sprint(rv))
+		}
+	}
+	return nil
+}
+
 func verifyRequest(r *http.Request, expectedRequest expectedRequest) error {
 	if r.Method != expectedRequest.method {
 		return getError("Invalid HTTP method", r.Method)
@@ -61,6 +174,10 @@ func verifyRequest(r *http.Request, expectedRequest expectedRequest) error {
 
 	if !strings.HasSuffix(r.URL.String(), expectedRequest.urlSuffix) {
 		return getError("Invalid URL", r.URL.String())
+	}
+
+	if expectedRequest.body == "" && r.Body != http.NoBody {
+		return getError("Expected No body", "but got some body to read")
 	}
 
 	b, err := ioutil.ReadAll(r.Body)
@@ -71,34 +188,7 @@ func verifyRequest(r *http.Request, expectedRequest expectedRequest) error {
 		return getError("Unexpected value for request body", string(b))
 	}
 
-	if expectedRequest.headers != nil {
-		actualHeaderLen := len(r.Header)
-		expectedHeaderLen := len(expectedRequest.headers)
-		if actualHeaderLen != expectedHeaderLen {
-			return getError(fmt.Sprintf("Wanted %d headers in request, got", expectedHeaderLen),
-				strconv.Itoa(actualHeaderLen))
-		}
-
-		for k, v := range expectedRequest.headers {
-			rv, ok := r.Header[k]
-			if !ok {
-				return getError("Required header not found", k)
-			}
-
-			if v == nil {
-				continue
-			}
-
-			sort.Strings(rv)
-			sort.Strings(v)
-
-			if !reflect.DeepEqual(rv, v) {
-				return getError(fmt.Sprintf("Unexpected value for %s header", k), fmt.Sprint(rv))
-			}
-		}
-	}
-
-	return nil
+	return compareHeaders(expectedRequest.headers, r.Header)
 }
 
 // bool parameter in return signifies whether it is an introspection query or not:
@@ -130,9 +220,8 @@ func verifyGraphqlRequest(r *http.Request, expectedRequest expectedGraphqlReques
 	return false, nil
 }
 
-func getDefaultResponse(resKey string) []byte {
-	resTemplate := `{
-		"%s": [
+func getDefaultResponse() []byte {
+	resTemplate := `[
 			{
 				"id": "0x3",
 				"name": "Star Wars",
@@ -153,10 +242,9 @@ func getDefaultResponse(resKey string) []byte {
 					}
 				]
 			}
-		]
-	}`
+		]`
 
-	return []byte(fmt.Sprintf(resTemplate, resKey))
+	return []byte(resTemplate)
 }
 
 func getFavMoviesHandler(w http.ResponseWriter, r *http.Request) {
@@ -170,7 +258,7 @@ func getFavMoviesHandler(w http.ResponseWriter, r *http.Request) {
 		check2(w.Write([]byte(err.Error())))
 		return
 	}
-	check2(w.Write(getDefaultResponse("myFavoriteMovies")))
+	check2(w.Write(getDefaultResponse()))
 }
 
 func postFavMoviesHandler(w http.ResponseWriter, r *http.Request) {
@@ -184,7 +272,7 @@ func postFavMoviesHandler(w http.ResponseWriter, r *http.Request) {
 		check2(w.Write([]byte(err.Error())))
 		return
 	}
-	check2(w.Write(getDefaultResponse("myFavoriteMoviesPost")))
+	check2(w.Write(getDefaultResponse()))
 }
 
 func verifyHeadersHandler(w http.ResponseWriter, r *http.Request) {
@@ -193,17 +281,43 @@ func verifyHeadersHandler(w http.ResponseWriter, r *http.Request) {
 		urlSuffix: "/verifyHeaders",
 		body:      "",
 		headers: map[string][]string{
-			"X-App-Token":     {"app-token"},
-			"X-User-Id":       {"123"},
-			"Accept-Encoding": nil,
-			"User-Agent":      nil,
+			"X-App-Token":      {"app-token"},
+			"X-User-Id":        {"123"},
+			"Github-Api-Token": {"random-fake-token"},
+			"Accept-Encoding":  nil,
+			"User-Agent":       nil,
 		},
 	})
 	if err != nil {
 		check2(w.Write([]byte(err.Error())))
 		return
 	}
-	check2(w.Write([]byte(`{"verifyHeaders":[{"id":"0x3","name":"Star Wars"}]}`)))
+	check2(w.Write([]byte(`[{"id":"0x3","name":"Star Wars"}]`)))
+}
+
+func twitterFollwerHandler(w http.ResponseWriter, r *http.Request) {
+	err := verifyRequest(r, expectedRequest{
+		method:    http.MethodGet,
+		urlSuffix: "/twitterfollowers?screen_name=manishrjain",
+		body:      "",
+	})
+	if err != nil {
+		check2(w.Write([]byte(err.Error())))
+		return
+	}
+	check2(w.Write([]byte(`
+	{
+		"users": [{
+			"id": 1231723732206411776,
+			"name": "hi_balaji",
+			"screen_name": "hi_balaji",
+			"location": "",
+			"description": "",
+			"followers_count": 0,
+			"friends_count": 117,
+			"statuses_count": 0
+		}]
+	}`)))
 }
 
 func favMoviesCreateHandler(w http.ResponseWriter, r *http.Request) {
@@ -218,9 +332,7 @@ func favMoviesCreateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	check2(w.Write([]byte(`
-	{
-      "createMyFavouriteMovies": [
+	check2(w.Write([]byte(`[
         {
           "id": "0x1",
           "name": "Mov1",
@@ -235,8 +347,7 @@ func favMoviesCreateHandler(w http.ResponseWriter, r *http.Request) {
           "id": "0x3",
           "name": "Mov2"
         }
-      ]
-    }`)))
+    ]`)))
 }
 
 func favMoviesUpdateHandler(w http.ResponseWriter, r *http.Request) {
@@ -253,7 +364,6 @@ func favMoviesUpdateHandler(w http.ResponseWriter, r *http.Request) {
 
 	check2(w.Write([]byte(`
 	{
-      "updateMyFavouriteMovie": {
         "id": "0x1",
         "name": "Mov1",
         "director": [
@@ -262,7 +372,6 @@ func favMoviesUpdateHandler(w http.ResponseWriter, r *http.Request) {
             "name": "Dir1"
           }
         ]
-      }
     }`)))
 }
 
@@ -285,10 +394,8 @@ func favMoviesDeleteHandler(w http.ResponseWriter, r *http.Request) {
 
 	check2(w.Write([]byte(`
 	{
-      "deleteMyFavouriteMovie": {
         "id": "0x1",
         "name": "Mov1"
-      }
     }`)))
 }
 
@@ -314,125 +421,6 @@ func emptyQuerySchema(w http.ResponseWriter, r *http.Request) {
 			  "kind": "OBJECT",
 			  "name": "Query",
 			  "fields": []
-			}]
-		  }
-	   }
-	}
-	`))
-}
-
-func invalidArgument(w http.ResponseWriter, r *http.Request) {
-	if _, err := verifyGraphqlRequest(r, expectedGraphqlRequest{
-		urlSuffix: "/invalidargument",
-		body:      ``,
-	}); err != nil {
-		check2(w.Write([]byte(err.Error())))
-		return
-	}
-	check2(fmt.Fprintf(w, `
-	{
-	"data": {
-		"__schema": {
-		  "queryType": {
-			"name": "Query"
-		  },
-		  "mutationType": null,
-		  "subscriptionType": null,
-		  "types": [
-			{
-			  "kind": "OBJECT",
-			  "name": "Query",
-			  "fields": [
-				{
-					"name": "country",
-					"args": [
-					  {
-						"name": "no_code",
-						"type": {
-						  "kind": "NON_NULL",
-						  "name": null,
-						  "ofType": {
-							"kind": "SCALAR",
-							"name": "ID",
-							"ofType": null
-						  }
-						},
-						"defaultValue": null
-					  }
-					],
-					"type": {
-					  "kind": "NON_NULL",
-					  "name": null,
-					  "ofType": {
-						"kind": "OBJECT",
-						"name": "Country",
-						"ofType": null
-					  }
-					},
-					"isDeprecated": false,
-					"deprecationReason": null
-				  }
-			  ]
-			}]
-		  }
-	   }
-	}
-	`))
-}
-
-func invalidType(w http.ResponseWriter, r *http.Request) {
-	if _, err := verifyGraphqlRequest(r, expectedGraphqlRequest{
-		urlSuffix: "/invalidtype",
-		body:      ``,
-	}); err != nil {
-		check2(w.Write([]byte(err.Error())))
-		return
-	}
-
-	check2(fmt.Fprintf(w, `
-	{
-	"data": {
-		"__schema": {
-		  "queryType": {
-			"name": "Query"
-		  },
-		  "mutationType": null,
-		  "subscriptionType": null,
-		  "types": [
-			{
-			  "kind": "OBJECT",
-			  "name": "Query",
-			  "fields": [
-				{
-					"name": "country",
-					"args": [
-					  {
-						"name": "code",
-						"type": {
-						  "kind": "NON_NULL",
-						  "name": null,
-						  "ofType": {
-							"kind": "SCALAR",
-							"name": "Int",
-							"ofType": null
-						  }
-						},
-						"defaultValue": null
-					  }
-					],
-					"type": {
-					  "kind": "NON_NULL",
-					  "name": null,
-					  "ofType": {
-						"kind": "OBJECT",
-						"name": "Country",
-						"ofType": null
-					  }
-					},
-					"isDeprecated": false,
-					"deprecationReason": null
-				  }
-			  ]
 			}]
 		  }
 	   }
@@ -494,58 +482,8 @@ func invalidInputForBatchedField(w http.ResponseWriter, r *http.Request) {
 		check2(w.Write([]byte(err.Error())))
 		return
 	}
-	check2(fmt.Fprintf(w, `
-		{
-		"data": {
-			"__schema": {
-			  "queryType": {
-				"name": "Query"
-			  },
-			  "mutationType": null,
-			  "subscriptionType": null,
-			  "types": [
-				{
-				  "kind": "OBJECT",
-				  "name": "Query",
-				  "fields": [
-					{
-						"name": "getPosts",
-						"args": [
-						  {
-							"name": "input",
-							"type": {
-							  "kind": "LIST",
-							  "name": null,
-							  "ofType": {
-								"kind": "SCALAR",
-								"name": "Int",
-								"ofType": null
-							  }
-							},
-							"defaultValue": null
-						  }
-						],
-						"type": {
-						  "kind": "LIST",
-						  "name": null,
-						  "ofType": {
-						 	"kind": "NON_NULL",
-						 	"name": null,
-							"ofType": {
-							  "kind": "OBJECT",
-							  "name": "Post",
-							  "ofType": null
-							}
-						  }
-						},
-						"isDeprecated": false,
-						"deprecationReason": null
-					  }
-				  ]
-				}]
-			  }
-		   }
-		}`))
+	check2(fmt.Fprint(w,
+		generateIntrospectionResult(graphqlResponses["invalidinputbatchedfield"].Schema)))
 }
 
 func missingTypeForBatchedFieldInput(w http.ResponseWriter, r *http.Request) {
@@ -595,458 +533,8 @@ func missingTypeForBatchedFieldInput(w http.ResponseWriter, r *http.Request) {
 						 	"name": null,
 							"ofType": {
 							  "kind": "OBJECT",
-							  "name": "Post",
-							  "ofType": null
-							}
-						  }
-						},
-						"isDeprecated": false,
-						"deprecationReason": null
-					  }
-				  ]
-				}]
-			  }
-		   }
-		}`))
-}
-
-func validCountryResponse(w http.ResponseWriter, r *http.Request) {
-	isIntrospection, err := verifyGraphqlRequest(r, expectedGraphqlRequest{
-		urlSuffix: "/validcountry",
-		body:      `{"query":"query { country(code: $id) {\ncode\nname\n}}","variables":{"id":"BI"}}`,
-	})
-	if err != nil {
-		check2(w.Write([]byte(err.Error())))
-		return
-	}
-
-	if isIntrospection {
-		check2(fmt.Fprintf(w, `
-	{
-	"data": {
-		"__schema": {
-		  "queryType": {
-			"name": "Query"
-		  },
-		  "mutationType": null,
-		  "subscriptionType": null,
-		  "types": [
-			{
-			  "kind": "OBJECT",
-			  "name": "Query",
-			  "fields": [
-				{
-					"name": "country",
-					"args": [
-					  {
-						"name": "code",
-						"type": {
-						  "kind": "NON_NULL",
-						  "name": null,
-						  "ofType": {
-							"kind": "SCALAR",
-							"name": "ID",
-							"ofType": null
-						  }
-						},
-						"defaultValue": null
-					  }
-					],
-					"type": {
-					  "kind": "NON_NULL",
-					  "name": null,
-					  "ofType": {
-						"kind": "OBJECT",
-						"name": "Country",
-						"ofType": null
-					  }
-					},
-					"isDeprecated": false,
-					"deprecationReason": null
-				  }
-			  ]
-			}]
-		  }
-	   }
-	}
-	`))
-	} else {
-		check2(fmt.Fprintf(w, `
-	{
-		"data": {
-		  "country": {
-			"name": "Burundi",
-			"code": "BI"
-		  }
-		}
-	  }`))
-	}
-}
-
-func graphqlErrResponse(w http.ResponseWriter, r *http.Request) {
-	isIntrospection, err := verifyGraphqlRequest(r, expectedGraphqlRequest{
-		urlSuffix: "/graphqlerr",
-		body:      `{"query":"query { country(code: $id) {\ncode\nname\n}}","variables":{"id":"BI"}}`,
-	})
-	if err != nil {
-		check2(w.Write([]byte(err.Error())))
-		return
-	}
-
-	if isIntrospection {
-		check2(fmt.Fprintf(w, `
-	{
-	"data": {
-		"__schema": {
-		  "queryType": {
-			"name": "Query"
-		  },
-		  "mutationType": null,
-		  "subscriptionType": null,
-		  "types": [
-			{
-			  "kind": "OBJECT",
-			  "name": "Query",
-			  "fields": [
-				{
-					"name": "country",
-					"args": [
-					  {
-						"name": "code",
-						"type": {
-						  "kind": "NON_NULL",
-						  "name": null,
-						  "ofType": {
-							"kind": "SCALAR",
-							"name": "ID",
-							"ofType": null
-						  }
-						},
-						"defaultValue": null
-					  }
-					],
-					"type": {
-					  "kind": "LIST",
-					  "name": null,
-					  "ofType": {
-						"kind": "OBJECT",
-						"name": "Country",
-						"ofType": null
-					  }
-					},
-					"isDeprecated": false,
-					"deprecationReason": null
-				  }
-			  ]
-			}]
-		  }
-	   }
-	}
-	`))
-	} else {
-		check2(fmt.Fprintf(w, `
-	{
-	   "errors":[{
-			"message": "dummy error"
-		}]
-	  }`))
-	}
-}
-
-func validCountryWithErrorResponse(w http.ResponseWriter, r *http.Request) {
-	isIntrospection, err := verifyGraphqlRequest(r, expectedGraphqlRequest{
-		urlSuffix: "/validcountrywitherror",
-		body:      `{"query":"query { country(code: $id) {\ncode\nname\n}}","variables":{"id":"BI"}}`,
-	})
-	if err != nil {
-		check2(w.Write([]byte(err.Error())))
-		return
-	}
-
-	if isIntrospection {
-		check2(fmt.Fprintf(w, `
-	{
-	"data": {
-		"__schema": {
-		  "queryType": {
-			"name": "Query"
-		  },
-		  "mutationType": null,
-		  "subscriptionType": null,
-		  "types": [
-			{
-			  "kind": "OBJECT",
-			  "name": "Query",
-			  "fields": [
-				{
-					"name": "country",
-					"args": [
-					  {
-						"name": "code",
-						"type": {
-						  "kind": "NON_NULL",
-						  "name": null,
-						  "ofType": {
-							"kind": "SCALAR",
-							"name": "ID",
-							"ofType": null
-						  }
-						},
-						"defaultValue": null
-					  }
-					],
-					"type": {
-					  "kind": "NON_NULL",
-					  "name": null,
-					  "ofType": {
-						"kind": "OBJECT",
-						"name": "Country",
-						"ofType": null
-					  }
-					},
-					"isDeprecated": false,
-					"deprecationReason": null
-				  }
-			  ]
-			}]
-		  }
-	   }
-	}
-	`))
-	} else {
-		check2(fmt.Fprintf(w, `
-	{
-		"data": {
-		  "country": {
-			"name": "Burundi",
-			"code": "BI"
-		  }
-		},
-		"errors":[{
-			"message": "dummy error"
-		}]
-	  }`))
-	}
-}
-
-func validCountries(w http.ResponseWriter, r *http.Request) {
-	isIntrospection, err := verifyGraphqlRequest(r, expectedGraphqlRequest{
-		urlSuffix: "/validcountries",
-		body:      `{"query":"query { country(code: $id) {\ncode\nname\n}}","variables":{"id":"BI"}}`,
-	})
-	if err != nil {
-		check2(w.Write([]byte(err.Error())))
-		return
-	}
-
-	if isIntrospection {
-		check2(fmt.Fprintf(w, `
-	{
-	"data": {
-		"__schema": {
-		  "queryType": {
-			"name": "Query"
-		  },
-		  "mutationType": null,
-		  "subscriptionType": null,
-		  "types": [
-			{
-			  "kind": "OBJECT",
-			  "name": "Query",
-			  "fields": [
-				{
-					"name": "country",
-					"args": [
-					  {
-						"name": "code",
-						"type": {
-						  "kind": "NON_NULL",
-						  "name": null,
-						  "ofType": {
-							"kind": "SCALAR",
-							"name": "ID",
-							"ofType": null
-						  }
-						},
-						"defaultValue": null
-					  }
-					],
-					"type": {
-					  "kind": "LIST",
-					  "name": null,
-					  "ofType": {
-						"kind": "OBJECT",
-						"name": "Country",
-						"ofType": null
-					  }
-					},
-					"isDeprecated": false,
-					"deprecationReason": null
-				  }
-			  ]
-			}]
-		  }
-	   }
-	}
-	`))
-	} else {
-		check2(fmt.Fprintf(w, `
-	{
-		"data": {
-		  "country": [
-			{
-			  "name": "Burundi",
-			  "code": "BI"
-			}
-		  ]
-	  }
-	  }`))
-	}
-}
-
-func setCountry(w http.ResponseWriter, r *http.Request) {
-	isIntrospection, err := verifyGraphqlRequest(r, expectedGraphqlRequest{
-		urlSuffix: "/setCountry",
-		body:      `{"query":"mutation { setCountry(country: $input) {\ncode\nname\nstates{\ncode\nname\n}\n}}","variables":{"input":{"code":"IN","name":"India","states":[{"code":"RJ","name":"Rajasthan"},{"code":"KA","name":"Karnataka"}]}}}`,
-	})
-	if err != nil {
-		check2(w.Write([]byte(err.Error())))
-		return
-	}
-
-	if isIntrospection {
-		check2(fmt.Fprintf(w, `
-		{
-		"data": {
-			"__schema": {
-			  "queryType": null,
-			  "mutationType":  {
-				"name": "MyMutations"
-			  },
-			  "subscriptionType": null,
-			  "types": [
-				{
-				  "kind": "OBJECT",
-				  "name": "MyMutations",
-				  "fields": [
-					{
-						"name": "setCountry",
-						"args": [
-						  {
-							"name": "country",
-							"type": {
-							  "kind": "NON_NULL",
-							  "name": null,
-							  "ofType": {
-								"kind": "OBJECT",
-								"name": "CountryInput",
-								"ofType": null
-							  }
-							},
-							"defaultValue": null
-						  }
-						],
-						"type": {
-						  "kind": "NON_NULL",
-						  "name": null,
-						  "ofType": {
-							"kind": "OBJECT",
-							"name": "Country",
-							"ofType": null
-						  }
-						},
-						"isDeprecated": false,
-						"deprecationReason": null
-					  }
-				  ]
-				}]
-			  }
-		   }
-		}`))
-	} else {
-		check2(fmt.Fprintf(w, `
-		{
-			"data": {
-				"setCountry": {
-					"code": "IN",
-					"name": "India",
-					"states": [
-						{
-							"code": "RJ",
-							"name": "Rajasthan"
-						},
-						{
-							"code": "KA",
-							"name": "Karnataka"
-						}
-					]
-				}
-			}
-		}`))
-	}
-}
-
-func updateCountries(w http.ResponseWriter, r *http.Request) {
-	isIntrospection, err := verifyGraphqlRequest(r, expectedGraphqlRequest{
-		urlSuffix: "/updateCountries",
-		body:      `{"query":"mutation { updateCountries(name: $name, std: $std) {\nname\nstd\n}}","variables":{"name":"Australia","std":91}}`,
-	})
-	if err != nil {
-		check2(w.Write([]byte(err.Error())))
-		return
-	}
-
-	if isIntrospection {
-		check2(fmt.Fprintf(w, `
-		{
-		"data": {
-			"__schema": {
-			  "queryType": null,
-			  "mutationType":  {
-				"name": "Mutation"
-			  },
-			  "subscriptionType": null,
-			  "types": [
-				{
-				  "kind": "OBJECT",
-				  "name": "Mutation",
-				  "fields": [
-					{
-						"name": "updateCountries",
-						"args": [
-						  {
-							"name": "name",
-							"type": {
-							  "kind": "SCALAR",
 							  "name": "String",
 							  "ofType": null
-							},
-							"defaultValue": null
-						  },
-						  {
-							"name": "std",
-							"type": {
-							  "kind": "SCALAR",
-							  "name": "Int",
-							  "ofType": null
-							},
-							"defaultValue": null
-						  }
-						],
-						"type": {
-						  "kind": "NON_NULL",
-						  "name": null,
-						  "ofType": {
-							"kind": "LIST",
-							"name": null,
-							"ofType": {
-							  "kind": "NON_NULL",
-							  "name": null,
-							  "ofType": {
-								"kind": "OBJECT",
-								"name": "Country",
-								"ofType": null
-							  }
 							}
 						  }
 						},
@@ -1058,23 +546,6 @@ func updateCountries(w http.ResponseWriter, r *http.Request) {
 			  }
 		   }
 		}`))
-	} else {
-		check2(fmt.Fprintf(w, `
-		{
-			"data": {
-				"updateCountries": [
-					{
-						"name": "India",
-						"std": 91
-					},
-					{
-						"name": "Australia",
-						"std": 61
-					}
-				]
-			}
-		}`))
-	}
 }
 
 func getPosts(w http.ResponseWriter, r *http.Request) {
@@ -1087,92 +558,20 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	check2(fmt.Fprintf(w, `
-		{
-		"data": {
-			"__schema": {
-			  "queryType": {
-				"name": "Query"
-			  },
-			  "mutationType": null,
-			  "subscriptionType": null,
-			  "types": [
-				{
-				  "kind": "OBJECT",
-				  "name": "Query",
-				  "fields": [
-					{
-						"name": "getPosts",
-						"args": [
-						  {
-							"name": "input",
-							"type": {
-							  "kind": "LIST",
-							  "name": null,
-							  "ofType": {
-								"kind": "INPUT_OBJECT",
-								"name": "PostFilterInput",
-								"ofType": null
-							  }
-							},
-							"defaultValue": null
-						  }
-						],
-						"type": {
-						  "kind": "LIST",
-						  "name": null,
-						  "ofType": {
-						 	"kind": "NON_NULL",
-						 	"name": null,
-							"ofType": {
-							  "kind": "OBJECT",
-							  "name": "Post",
-							  "ofType": null
-							}
-						  }
-						},
-						"isDeprecated": false,
-						"deprecationReason": null
-					  }
-				  ]
-				},
-				{
-				  "kind": "INPUT_OBJECT",
-				  "name": "PostFilterInput",
-				  "fields": [
-					{
-						"name": "id",
-						"type": {
-						  "kind": "NON_NULL",
-						  "name": null,
-						  "ofType": {
-						 	"kind": "SCALAR",
-						 	"name": "ID",
-							"ofType": null
-						  }
-						},
-						"isDeprecated": false,
-						"deprecationReason": null
-					},
-					{
-						"name": "text",
-						"type": {
-						  "kind": "NON_NULL",
-						  "name": null,
-						  "ofType": {
-						 	"kind": "SCALAR",
-						 	"name": "String",
-							"ofType": null
-						  }
-						},
-						"isDeprecated": false,
-						"deprecationReason": null
-					}
-				  ]
-				}]
-			  }
-		   }
-		}`))
+	check2(fmt.Fprint(w, generateIntrospectionResult(graphqlResponses["getPosts"].Schema)))
+}
+
+func getPostswithLike(w http.ResponseWriter, r *http.Request) {
+	_, err := verifyGraphqlRequest(r, expectedGraphqlRequest{
+		urlSuffix: "/getPostswithLike",
+		body:      ``,
+	})
+	if err != nil {
+		check2(w.Write([]byte(err.Error())))
+		return
+	}
+
+	check2(fmt.Fprint(w, generateIntrospectionResult(graphqlResponses["getPostswithLike"].Schema)))
 }
 
 type input struct {
@@ -1276,6 +675,34 @@ func schoolNamesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	check2(fmt.Fprint(w, string(b)))
+}
+
+func deleteCommonHeaders(headers http.Header) {
+	delete(headers, "Accept-Encoding")
+	delete(headers, "Content-Length")
+	delete(headers, "User-Agent")
+}
+
+func carsHandlerWithHeaders(w http.ResponseWriter, r *http.Request) {
+	deleteCommonHeaders(r.Header)
+	if err := compareHeaders(map[string][]string{
+		"Stripe-Api-Key": []string{"some-api-key"},
+	}, r.Header); err != nil {
+		check2(w.Write([]byte(err.Error())))
+		return
+	}
+	check2(fmt.Fprint(w, `[{"name": "foo"},{"name": "foo"},{"name": "foo"}]`))
+}
+
+func userNameHandlerWithHeaders(w http.ResponseWriter, r *http.Request) {
+	deleteCommonHeaders(r.Header)
+	if err := compareHeaders(map[string][]string{
+		"Github-Api-Token": []string{"some-api-token"},
+	}, r.Header); err != nil {
+		check2(w.Write([]byte(err.Error())))
+		return
+	}
+	check2(fmt.Fprint(w, `"foo"`))
 }
 
 func carsHandler(w http.ResponseWriter, r *http.Request) {
@@ -1394,50 +821,8 @@ func schoolNameHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func introspectedSchemaForQuery(fieldName, idsField string) string {
-	return fmt.Sprintf(`{
-		"data":{
-			"__schema":{
-			"queryType":{
-				"name":"Query"
-			},
-			"mutationType":null,
-			"subscriptionType":null,
-			"types":[
-				{
-				"kind":"OBJECT",
-				"name":"Query",
-				"fields":[
-					{
-					"name":"%s",
-					"args":[
-						{
-						"name":"%s",
-						"type":{
-							"kind":"NON_NULL",
-							"name":null,
-							"ofType":{
-								"kind":"SCALAR",
-								"name":"ID",
-								"ofType":null
-							}
-						},
-						"defaultValue":null
-						}
-					],
-					"type":{
-						"kind":"SCALAR",
-						"name":"String",
-						"ofType":null
-					},
-					"isDeprecated":false,
-					"deprecationReason":null
-					}
-				]
-				}
-			]
-			}
-		}
-	}`, fieldName, idsField)
+	return generateIntrospectionResult(
+		fmt.Sprintf(graphqlResponses["introspectedSchemaForQuery"].Schema, fieldName, idsField))
 }
 
 type request struct {
@@ -1445,7 +830,72 @@ type request struct {
 	Variables map[string]interface{}
 }
 
-func gqlUserNameHandler(w http.ResponseWriter, r *http.Request) {
+type query struct{}
+
+type country struct {
+	Code graphql.ID
+	Name string
+}
+
+type countryResolver struct {
+	c *country
+}
+
+func (r countryResolver) Code() *string {
+	s := string(r.c.Code)
+	return &(s)
+}
+
+func (r countryResolver) Name() *string {
+	return &(r.c.Name)
+}
+
+func (_ *query) Country(ctx context.Context, args struct {
+	Code string
+}) countryResolver {
+	return countryResolver{&country{Code: graphql.ID(args.Code), Name: "Burundi"}}
+}
+
+func (_ *query) Countries(ctx context.Context, args struct {
+	Filter struct {
+		Code string
+		Name string
+	}
+}) []countryResolver {
+	return []countryResolver{countryResolver{&country{
+		Code: graphql.ID(args.Filter.Code),
+		Name: args.Filter.Name,
+	}}}
+}
+
+func (_ *query) ValidCountries(ctx context.Context, args struct {
+	Code string
+}) *[]*countryResolver {
+	return &[]*countryResolver{{&country{Code: graphql.ID(args.Code), Name: "Burundi"}}}
+}
+
+func (_ *query) UserName(ctx context.Context, args struct {
+	Id string
+}) *string {
+	s := fmt.Sprintf(`uname-%s`, args.Id)
+	return &s
+}
+
+func (_ *query) TeacherName(ctx context.Context, args struct {
+	Id string
+}) *string {
+	s := fmt.Sprintf(`tname-%s`, args.Id)
+	return &s
+}
+
+func (_ *query) SchoolName(ctx context.Context, args struct {
+	Id string
+}) *string {
+	s := fmt.Sprintf(`sname-%s`, args.Id)
+	return &s
+}
+
+func gqlUserNameWithErrorHandler(w http.ResponseWriter, r *http.Request) {
 	b, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		return
@@ -1455,475 +905,156 @@ func gqlUserNameHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, introspectedSchemaForQuery("userName", "id"))
 		return
 	}
-
 	var req request
 	if err := json.Unmarshal(b, &req); err != nil {
 		return
 	}
-	// TODO - Have tests in place either here or as part of unit tests to verify the queries
-	// that are finally sent.
 	userID := req.Variables["id"].(string)
 	fmt.Fprintf(w, `
 	{
 		"data": {
 		  "userName": "uname-%s"
-		}
-	}`, userID)
-}
-
-func gqlCarHandler(w http.ResponseWriter, r *http.Request) {
-	b, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return
-	}
-
-	// FIXME - Return type isn't validated yet.
-	if strings.Contains(string(b), "__schema") {
-		fmt.Fprintf(w, `{
-			"data":{
-				"__schema":{
-				"queryType":{
-					"name":"Query"
-				},
-				"mutationType":null,
-				"subscriptionType":null,
-				"types":[
-					{
-					"kind":"OBJECT",
-					"name":"Query",
-					"fields":[
-						{
-						"name": "car",
-						"args":[
-							{
-							"name":"id",
-							"type":{
-								"kind":"NON_NULL",
-								"name":null,
-								"ofType":{
-									"kind":"SCALAR",
-									"name":"ID",
-									"ofType":null
-								}
-							},
-							"defaultValue":null
-							}
-						],
-						"type":{
-							"kind": "OBJECT",
-							"name": "Car",
-							"ofType": null
-						},
-						"isDeprecated":false,
-						"deprecationReason":null
-						}
-					]
-					}
-				]
-				}
-			}
-		}`)
-		return
-	}
-
-	var req request
-	if err := json.Unmarshal(b, &req); err != nil {
-		return
-	}
-
-	userID := req.Variables["id"]
-	fmt.Fprintf(w, `
-	{
-		"data": {
-		  	"car": {
-				"name": "car-%s"
-			}
-		}
-	}`, userID)
-}
-
-func gqlClassHandler(w http.ResponseWriter, r *http.Request) {
-	b, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return
-	}
-
-	if strings.Contains(string(b), "__schema") {
-		fmt.Fprintf(w, `{
-			"data":{
-				"__schema":{
-				"queryType":{
-					"name":"Query"
-				},
-				"mutationType":null,
-				"subscriptionType":null,
-				"types":[
-					{
-					"kind":"OBJECT",
-					"name":"Query",
-					"fields":[
-						{
-						"name": "class",
-						"args":[
-							{
-							"name":"id",
-							"type":{
-								"kind":"NON_NULL",
-								"name":null,
-								"ofType":{
-									"kind":"SCALAR",
-									"name":"ID",
-									"ofType":null
-								}
-							},
-							"defaultValue":null
-							}
-						],
-						"type":{
-							"kind": "LIST",
-							"name": null,
-							"ofType": {
-								"kind": "OBJECT",
-								"name": "Class",
-								"ofType": null
-							}
-						},
-						"isDeprecated":false,
-						"deprecationReason":null
-						}
-					]
-					}
-				]
-				}
-			}
-		}`)
-		return
-	}
-
-	var req request
-	if err := json.Unmarshal(b, &req); err != nil {
-		return
-	}
-	schoolID := req.Variables["id"]
-	fmt.Fprintf(w, `
-	{
-		"data": {
-		  "class": [{
-			  "name": "class-%s"
-		  }]
-		}
-	}`, schoolID)
-}
-
-func gqlTeacherNameHandler(w http.ResponseWriter, r *http.Request) {
-	b, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return
-	}
-
-	if strings.Contains(string(b), "__schema") {
-		fmt.Fprint(w, introspectedSchemaForQuery("teacherName", "id"))
-		return
-	}
-
-	var req request
-	if err := json.Unmarshal(b, &req); err != nil {
-		return
-	}
-	teacherID := req.Variables["tid"]
-	fmt.Fprintf(w, `
-	{
-		"data": {
-		  "teacherName": "tname-%s"
-		}
-	}`, teacherID)
-}
-
-func gqlSchoolNameHandler(w http.ResponseWriter, r *http.Request) {
-	b, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return
-	}
-
-	if strings.Contains(string(b), "__schema") {
-		fmt.Fprint(w, introspectedSchemaForQuery("schoolName", "id"))
-		return
-	}
-
-	var req request
-	if err := json.Unmarshal(b, &req); err != nil {
-		return
-	}
-	schoolID := req.Variables["id"]
-	fmt.Fprintf(w, `
-	{
-		"data": {
-		  "schoolName": "sname-%s"
-		}
-	}`, schoolID)
-}
-
-func introspectionResult(name string) string {
-	return fmt.Sprintf(`{
-		"data":{
-			"__schema":{
-			"queryType":{
-				"name":"Query"
-			},
-			"mutationType":null,
-			"subscriptionType":null,
-			"types":[
-				{
-				"kind":"OBJECT",
-				"name":"Query",
-				"fields":[
-					{
-					"name":"%s",
-					"args":[
-						{
-						"name":"input",
-						"type":{
-							"kind":"LIST",
-							"name":null,
-							"ofType": {
-								"kind": "INPUT_OBJECT",
-								"name": "UserInput",
-								"ofType": null
-							}
-						},
-						"defaultValue":null
-						}
-					],
-					"type":{
-						"kind": "LIST",
-						"name": null,
-						"ofType": {
-							"kind":"SCALAR",
-							"name":"String",
-							"ofType":null
-						}
-					},
-					"isDeprecated":false,
-					"deprecationReason":null
-					}
-				]
-				},
-				{
-				  "kind": "INPUT_OBJECT",
-				  "name": "UserInput",
-				  "fields": [
-					{
-						"name": "id",
-						"type": {
-						  "kind": "NON_NULL",
-						  "name": null,
-						  "ofType": {
-						 	"kind": "SCALAR",
-						 	"name": "ID",
-							"ofType": null
-						  }
-						},
-						"isDeprecated": false,
-						"deprecationReason": null
-					},
-					{
-						"name": "age",
-						"type": {
-						  "kind": "NON_NULL",
-						  "name": null,
-						  "ofType": {
-						 	"kind": "SCALAR",
-						 	"name": "Int",
-							"ofType": null
-						  }
-						},
-						"isDeprecated": false,
-						"deprecationReason": null
-					}
-				  ]
-				}
-			]
-			}
-		}
-	}`, name)
-}
-
-func makeResponse(b []byte, id, key, prefix string) (string, error) {
-	var req request
-	if err := json.Unmarshal(b, &req); err != nil {
-		return "", err
-	}
-	input := req.Variables["input"]
-	output := []string{}
-	for _, i := range input.([]interface{}) {
-		im := i.(map[string]interface{})
-		id := im[id].(string)
-		output = append(output, prefix+id)
-	}
-
-	response := map[string]interface{}{
-		"data": map[string]interface{}{
-			key: output,
 		},
-	}
-
-	b, err := json.Marshal(response)
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
-}
-
-func gqlUserNamesHandler(w http.ResponseWriter, r *http.Request) {
-	b, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return
-	}
-
-	if strings.Contains(string(b), "__schema") {
-		fmt.Fprint(w, introspectionResult("userNames"))
-		return
-	}
-
-	res, err := makeResponse(b, "id", "userNames", "uname-")
-	if err != nil {
-		return
-	}
-	fmt.Fprint(w, res)
-}
-
-func gqlTeacherNamesHandler(w http.ResponseWriter, r *http.Request) {
-	b, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return
-	}
-
-	if strings.Contains(string(b), "__schema") {
-		fmt.Fprint(w, introspectionResult("teacherNames"))
-		return
-	}
-
-	res, err := makeResponse(b, "tid", "teacherNames", "tname-")
-	if err != nil {
-		return
-	}
-	fmt.Fprint(w, res)
-}
-
-func gqlSchoolNamesHandler(w http.ResponseWriter, r *http.Request) {
-	b, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return
-	}
-
-	if strings.Contains(string(b), "__schema") {
-		fmt.Fprint(w, introspectionResult("schoolNames"))
-		return
-	}
-
-	res, err := makeResponse(b, "id", "schoolNames", "sname-")
-	if err != nil {
-		return
-	}
-	fmt.Fprint(w, res)
-}
-
-func gqlCarsHandler(w http.ResponseWriter, r *http.Request) {
-	b, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return
-	}
-
-	if strings.Contains(string(b), "__schema") {
-		fmt.Fprintf(w, `{
-			"data":{
-				"__schema":{
-				"queryType":{
-					"name":"Query"
-				},
-				"mutationType":null,
-				"subscriptionType":null,
-				"types":[
-					{
-					"kind":"OBJECT",
-					"name":"Query",
-					"fields":[
-						{
-						"name":"cars",
-						"args":[
-							{
-							"name":"input",
-							"type":{
-								"kind":"LIST",
-								"name":null,
-								"ofType": {
-									"kind": "INPUT_OBJECT",
-									"name": "UserInput",
-									"ofType": null
-								}
-							},
-							"defaultValue":null
-							}
-						],
-						"type":{
-							"kind": "LIST",
-							"name": null,
-							"ofType": {
-								"kind":"OBJECT",
-								"name":"Car",
-								"ofType":null
-							}
-						},
-						"isDeprecated":false,
-						"deprecationReason":null
-						}
-					]
-					},
-				{
-				  "kind": "INPUT_OBJECT",
-				  "name": "UserInput",
-				  "fields": [
-					{
-						"name": "id",
-						"type": {
-						  "kind": "NON_NULL",
-						  "name": null,
-						  "ofType": {
-						 	"kind": "SCALAR",
-						 	"name": "ID",
-							"ofType": null
-						  }
-						},
-						"isDeprecated": false,
-						"deprecationReason": null
-					},
-					{
-						"name": "age",
-						"type": {
-						  "kind": "NON_NULL",
-						  "name": null,
-						  "ofType": {
-						 	"kind": "SCALAR",
-						 	"name": "Int",
-							"ofType": null
-						  }
-						},
-						"isDeprecated": false,
-						"deprecationReason": null
-					}
-				  ]
-				}
-				]
-				}
+		"errors": [
+			{
+				"message": "error-1 from username"
+			},
+			{
+				"message": "error-2 from username"
 			}
-		}`)
-		return
-	}
+		]
+	}`, userID)
+}
 
-	var req request
-	if err := json.Unmarshal(b, &req); err != nil {
-		return
+type car struct {
+	ID graphql.ID
+}
+
+type carResolver struct {
+	c *car
+}
+
+func (r *carResolver) ID() graphql.ID {
+	return r.c.ID
+}
+
+func (r *carResolver) Name() string {
+	return "car-" + string(r.c.ID)
+}
+
+func (_ *query) Car(ctx context.Context, args struct {
+	Id string
+}) *carResolver {
+	return &carResolver{&car{ID: graphql.ID(args.Id)}}
+}
+
+type class struct {
+	ID graphql.ID
+}
+
+type classResolver struct {
+	c *class
+}
+
+func (r *classResolver) ID() graphql.ID {
+	return r.c.ID
+}
+
+func (r *classResolver) Name() string {
+	return "class-" + string(r.c.ID)
+}
+
+func (_ *query) Class(ctx context.Context, args struct {
+	Id string
+}) *[]*classResolver {
+	return &[]*classResolver{&classResolver{&class{ID: graphql.ID(args.Id)}}}
+}
+
+func (_ *query) UserNames(ctx context.Context, args struct {
+	Users *[]*struct {
+		Id  string
+		Age float64
 	}
+}) *[]*string {
+	res := make([]*string, 0)
+	if args.Users == nil {
+		return nil
+	}
+	for _, arg := range *args.Users {
+		n := fmt.Sprintf(`uname-%s`, arg.Id)
+		res = append(res, &n)
+	}
+	return &res
+}
+
+func (_ *query) Cars(ctx context.Context, args struct {
+	Users *[]*struct {
+		Id  string
+		Age float64
+	}
+}) *[]*carResolver {
+	if args.Users == nil {
+		return nil
+	}
+	resolvers := make([]*carResolver, 0, len(*args.Users))
+	for _, user := range *args.Users {
+		resolvers = append(resolvers, &carResolver{&car{ID: graphql.ID(user.Id)}})
+	}
+	return &resolvers
+}
+
+func (_ *query) Classes(ctx context.Context, args struct {
+	Schools *[]*struct {
+		Id          string
+		Established float64
+	}
+}) *[]*[]*classResolver {
+	if args.Schools == nil {
+		return nil
+	}
+	resolvers := make([]*[]*classResolver, 0, len(*args.Schools))
+	for _, user := range *args.Schools {
+		resolvers = append(resolvers, &[]*classResolver{
+			&classResolver{&class{ID: graphql.ID(user.Id)}}})
+	}
+	return &resolvers
+}
+
+func (_ *query) TeacherNames(ctx context.Context, args struct {
+	Teachers *[]*struct {
+		Tid string
+		Age float64
+	}
+}) *[]*string {
+	if args.Teachers == nil {
+		return nil
+	}
+	res := make([]*string, 0)
+	for _, arg := range *args.Teachers {
+		n := fmt.Sprintf(`tname-%s`, arg.Tid)
+		res = append(res, &n)
+	}
+	return &res
+}
+
+func (_ *query) SchoolNames(ctx context.Context, args struct {
+	Schools *[]*struct {
+		Id          string
+		Established float64
+	}
+}) *[]*string {
+	if args.Schools == nil {
+		return nil
+	}
+	res := make([]*string, 0)
+	for _, arg := range *args.Schools {
+		n := fmt.Sprintf(`sname-%s`, arg.Id)
+		res = append(res, &n)
+	}
+	return &res
+}
+
+func buildCarBatchOutput(b []byte, req request) []interface{} {
 	input := req.Variables["input"]
 	output := []interface{}{}
 	for _, i := range input.([]interface{}) {
@@ -1933,113 +1064,17 @@ func gqlCarsHandler(w http.ResponseWriter, r *http.Request) {
 			"name": "car-" + id,
 		})
 	}
-
-	response := map[string]interface{}{
-		"data": map[string]interface{}{
-			"cars": output,
-		},
-	}
-
-	b, err = json.Marshal(response)
-	if err != nil {
-		return
-	}
-	check2(fmt.Fprint(w, string(b)))
+	return output
 }
 
-func gqlClassesHandler(w http.ResponseWriter, r *http.Request) {
+func gqlCarsWithErrorHandler(w http.ResponseWriter, r *http.Request) {
 	b, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		return
 	}
 
 	if strings.Contains(string(b), "__schema") {
-		fmt.Fprintf(w, `{
-			"data":{
-				"__schema":{
-				"queryType":{
-					"name":"Query"
-				},
-				"mutationType":null,
-				"subscriptionType":null,
-				"types":[
-					{
-					"kind":"OBJECT",
-					"name":"Query",
-					"fields":[
-						{
-						"name":"classes",
-						"args":[
-							{
-							"name":"input",
-							"type":{
-								"kind":"LIST",
-								"name":null,
-								"ofType": {
-									"kind": "INPUT_OBJECT",
-									"name": "UserInput",
-									"ofType": null
-								}
-							},
-							"defaultValue":null
-							}
-						],
-						"type":{
-							"kind": "LIST",
-							"name": null,
-							"ofType": {
-								"kind": "LIST",
-								"name": null,
-								"ofType": {
-									"kind":"OBJECT",
-									"name":"Class",
-									"ofType":null
-								}
-							}
-						},
-						"isDeprecated":false,
-						"deprecationReason":null
-						}
-					]
-					},
-				{
-				  "kind": "INPUT_OBJECT",
-				  "name": "UserInput",
-				  "fields": [
-					{
-						"name": "id",
-						"type": {
-						  "kind": "NON_NULL",
-						  "name": null,
-						  "ofType": {
-						 	"kind": "SCALAR",
-						 	"name": "ID",
-							"ofType": null
-						  }
-						},
-						"isDeprecated": false,
-						"deprecationReason": null
-					},
-					{
-						"name": "age",
-						"type": {
-						  "kind": "NON_NULL",
-						  "name": null,
-						  "ofType": {
-						 	"kind": "SCALAR",
-						 	"name": "Int",
-							"ofType": null
-						  }
-						},
-						"isDeprecated": false,
-						"deprecationReason": null
-					}
-				  ]
-				}
-				]
-				}
-			}
-		}`)
+		fmt.Fprint(w, generateIntrospectionResult(graphqlResponses["carsschema"].Schema))
 		return
 	}
 
@@ -2047,21 +1082,19 @@ func gqlClassesHandler(w http.ResponseWriter, r *http.Request) {
 	if err := json.Unmarshal(b, &req); err != nil {
 		return
 	}
-	input := req.Variables["input"]
-	output := []interface{}{}
-	for _, i := range input.([]interface{}) {
-		im := i.(map[string]interface{})
-		id := im["id"].(string)
-		output = append(output, []map[string]interface{}{
-			{
-				"name": "class-" + id,
-			},
-		})
-	}
 
+	output := buildCarBatchOutput(b, req)
 	response := map[string]interface{}{
 		"data": map[string]interface{}{
-			"classes": output,
+			"cars": output,
+		},
+		"errors": []map[string]interface{}{
+			map[string]interface{}{
+				"message": "error-1 from cars",
+			},
+			map[string]interface{}{
+				"message": "error-2 from cars",
+			},
 		},
 	}
 
@@ -2073,7 +1106,6 @@ func gqlClassesHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-
 	/*************************************
 	* For testing http without graphql
 	*************************************/
@@ -2082,6 +1114,7 @@ func main() {
 	http.HandleFunc("/favMovies/", getFavMoviesHandler)
 	http.HandleFunc("/favMoviesPost/", postFavMoviesHandler)
 	http.HandleFunc("/verifyHeaders", verifyHeadersHandler)
+	http.HandleFunc("/twitterfollowers", twitterFollwerHandler)
 
 	// for mutations
 	http.HandleFunc("/favMoviesCreate", favMoviesCreateHandler)
@@ -2092,12 +1125,14 @@ func main() {
 	// for testing batch mode
 	http.HandleFunc("/userNames", userNamesHandler)
 	http.HandleFunc("/cars", carsHandler)
+	http.HandleFunc("/checkHeadersForCars", carsHandlerWithHeaders)
 	http.HandleFunc("/classes", classesHandler)
 	http.HandleFunc("/teacherNames", teacherNamesHandler)
 	http.HandleFunc("/schoolNames", schoolNamesHandler)
 
 	// for testing single mode
 	http.HandleFunc("/userName", userNameHandler)
+	http.HandleFunc("/checkHeadersForUserName", userNameHandlerWithHeaders)
 	http.HandleFunc("/car", carHandler)
 	http.HandleFunc("/class", classHandler)
 	http.HandleFunc("/teacherName", teacherNameHandler)
@@ -2109,37 +1144,62 @@ func main() {
 
 	// for remote schema validation
 	http.HandleFunc("/noquery", emptyQuerySchema)
-	http.HandleFunc("/invalidargument", invalidArgument)
-	http.HandleFunc("/invalidtype", invalidType)
+	http.HandleFunc("/invalidargument", commonGraphqlHandler("invalidargument"))
+	http.HandleFunc("/invalidtype", commonGraphqlHandler("invalidtype"))
 	http.HandleFunc("/nullQueryAndMutationType", nullQueryAndMutationType)
 	http.HandleFunc("/missingQueryAndMutationType", missingQueryAndMutationType)
 	http.HandleFunc("/invalidInputForBatchedField", invalidInputForBatchedField)
 	http.HandleFunc("/missingTypeForBatchedFieldInput", missingTypeForBatchedFieldInput)
 
 	// for queries
-	http.HandleFunc("/validcountry", validCountryResponse)
-	http.HandleFunc("/validcountrywitherror", validCountryWithErrorResponse)
-	http.HandleFunc("/graphqlerr", graphqlErrResponse)
-	http.HandleFunc("/validcountries", validCountries)
+	vsch := graphql.MustParseSchema(graphqlResponses["validcountry"].Schema, &query{})
+	http.Handle("/validcountry", &relay.Handler{Schema: vsch})
+	http.HandleFunc("/validcountrywitherror", commonGraphqlHandler("validcountrywitherror"))
+	http.HandleFunc("/graphqlerr", commonGraphqlHandler("graphqlerr"))
+	http.Handle("/validcountries", &relay.Handler{
+		Schema: graphql.MustParseSchema(graphqlResponses["validcountries"].Schema, &query{}),
+	})
+	http.Handle("/validinputfield", &relay.Handler{
+		Schema: graphql.MustParseSchema(graphqlResponses["validinputfield"].Schema, &query{}),
+	})
+	http.HandleFunc("/invalidfield", commonGraphqlHandler("invalidfield"))
+	http.HandleFunc("/nestedinvalid", commonGraphqlHandler("nestedinvalid"))
+	http.HandleFunc("/validatesecrettoken", func(w http.ResponseWriter, r *http.Request) {
+		if h := r.Header.Get("Github-Api-Token"); h != "random-api-token" {
+			return
+		}
+		rh := &relay.Handler{
+			Schema: graphql.MustParseSchema(graphqlResponses["validinputfield"].Schema, &query{}),
+		}
+		rh.ServeHTTP(w, r)
+	})
 
 	// for mutations
-	http.HandleFunc("/setCountry", setCountry)
-	http.HandleFunc("/updateCountries", updateCountries)
+	http.HandleFunc("/setCountry", commonGraphqlHandler("setcountry"))
+	http.HandleFunc("/updateCountries", commonGraphqlHandler("updatecountries"))
 
 	// for testing single mode
-	http.HandleFunc("/gqlUserName", gqlUserNameHandler)
-	http.HandleFunc("/gqlCar", gqlCarHandler)
-	http.HandleFunc("/gqlClass", gqlClassHandler)
-	http.HandleFunc("/gqlTeacherName", gqlTeacherNameHandler)
-	http.HandleFunc("/gqlSchoolName", gqlSchoolNameHandler)
+	sch := graphql.MustParseSchema(graphqlResponses["singleOperationSchema"].Schema, &query{})
+	h := &relay.Handler{Schema: sch}
+	http.Handle("/gqlUserName", h)
+	// TODO - Figure out how to return multiple errors and then replace the handler below.
+	http.HandleFunc("/gqlUserNameWithError", gqlUserNameWithErrorHandler)
+	http.Handle("/gqlCar", h)
+	http.Handle("/gqlClass", h)
+	http.Handle("/gqlTeacherName", h)
+	http.Handle("/gqlSchoolName", h)
 
 	// for testing in batch mode
+	bsch := graphql.MustParseSchema(graphqlResponses["batchOperationSchema"].Schema, &query{})
+	bh := &relay.Handler{Schema: bsch}
 	http.HandleFunc("/getPosts", getPosts)
-	http.HandleFunc("/gqlUserNames", gqlUserNamesHandler)
-	http.HandleFunc("/gqlCars", gqlCarsHandler)
-	http.HandleFunc("/gqlClasses", gqlClassesHandler)
-	http.HandleFunc("/gqlTeacherNames", gqlTeacherNamesHandler)
-	http.HandleFunc("/gqlSchoolNames", gqlSchoolNamesHandler)
+	http.HandleFunc("/getPostswithLike", getPostswithLike)
+	http.Handle("/gqlUserNames", bh)
+	http.Handle("/gqlCars", bh)
+	http.HandleFunc("/gqlCarsWithErrors", gqlCarsWithErrorHandler)
+	http.Handle("/gqlClasses", bh)
+	http.Handle("/gqlTeacherNames", bh)
+	http.Handle("/gqlSchoolNames", bh)
 
 	fmt.Println("Listening on port 8888")
 	log.Fatal(http.ListenAndServe(":8888", nil))

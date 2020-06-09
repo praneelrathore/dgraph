@@ -56,6 +56,7 @@ type Server struct {
 
 	NumReplicas int
 	state       *pb.MembershipState
+	nextRaftId  uint64
 
 	nextLeaseId uint64
 	nextTxnTs   uint64
@@ -83,6 +84,7 @@ func (s *Server) Init() {
 		Groups: make(map[uint32]*pb.Group),
 		Zeros:  make(map[uint64]*pb.Member),
 	}
+	s.nextRaftId = 1
 	s.nextLeaseId = 1
 	s.nextTxnTs = 1
 	s.nextGroup = 1
@@ -217,7 +219,10 @@ func (s *Server) hasLeader(gid uint32) bool {
 func (s *Server) SetMembershipState(state *pb.MembershipState) {
 	s.Lock()
 	defer s.Unlock()
+
 	s.state = state
+	s.nextRaftId = x.Max(s.nextRaftId, s.state.MaxRaftId+1)
+
 	if state.Zeros == nil {
 		state.Zeros = make(map[uint64]*pb.Member)
 	}
@@ -434,7 +439,7 @@ func (s *Server) Connect(ctx context.Context,
 		}
 		return cs, err
 	}
-	if len(m.Addr) == 0 {
+	if m.Addr == "" {
 		return &emptyConnectionState, errors.Errorf("NO_ADDR: No address provided: %+v", m)
 	}
 
@@ -491,7 +496,11 @@ func (s *Server) Connect(ctx context.Context,
 			}
 		}
 		if m.Id == 0 {
-			m.Id = s.state.MaxRaftId + 1
+			// In certain situations, the proposal can be sent and return with an error.
+			// However,  Dgraph will keep retrying the proposal. To avoid assigning duplicating
+			// IDs, the couter is incremented every time a proposal is created.
+			m.Id = s.nextRaftId
+			s.nextRaftId += 1
 			proposal.MaxRaftId = m.Id
 		}
 
@@ -568,7 +577,7 @@ func (s *Server) ShouldServe(
 	ctx, span := otrace.StartSpan(ctx, "Zero.ShouldServe")
 	defer span.End()
 
-	if len(tablet.Predicate) == 0 {
+	if tablet.Predicate == "" {
 		return resp, errors.Errorf("Tablet predicate is empty in %+v", tablet)
 	}
 	if tablet.GroupId == 0 && !tablet.ReadOnly {
@@ -780,6 +789,6 @@ func (s *Server) applyLicense(ctx context.Context, signedData io.Reader) error {
 	if err != nil {
 		return errors.Wrapf(err, "while proposing enterprise license state to cluster")
 	}
-	glog.Infof("Enterprise license state proposed to the cluster")
+	glog.Infof("Enterprise license proposed to the cluster %+v", proposal)
 	return nil
 }

@@ -15,6 +15,7 @@ package worker
 import (
 	"context"
 	"net/url"
+	"sort"
 	"time"
 
 	"github.com/dgraph-io/dgraph/posting"
@@ -49,7 +50,7 @@ func backupCurrentGroup(ctx context.Context, req *pb.BackupRequest) (*pb.Status,
 		return nil, err
 	}
 
-	bp := &BackupProcessor{DB: pstore, Request: req}
+	bp := NewBackupProcessor(pstore, req)
 	return bp.WriteBackup(ctx)
 }
 
@@ -116,8 +117,8 @@ func ProcessBackupRequest(ctx context.Context, req *pb.BackupRequest, forceFull 
 	if forceFull {
 		req.SinceTs = 0
 	} else {
-		if Config.BadgerKeyFile != "" {
-			// If encryption turned on, latest backup should be encrypted.
+		if x.WorkerConfig.EncryptionKey != nil {
+			// If encryption key given, latest backup should be encrypted.
 			if latestManifest.Type != "" && !latestManifest.Encrypted {
 				err = errors.Errorf("latest manifest indicates the last backup was not encrypted " +
 					"but this instance has encryption turned on. Try \"forceFull\" flag.")
@@ -182,10 +183,24 @@ func ProcessBackupRequest(ctx context.Context, req *pb.BackupRequest, forceFull 
 		m.BackupId = latestManifest.BackupId
 		m.BackupNum = latestManifest.BackupNum + 1
 	}
-	if Config.BadgerKeyFile != "" {
-		m.Encrypted = true
+	m.Encrypted = (x.WorkerConfig.EncryptionKey != nil)
+
+	bp := NewBackupProcessor(nil, req)
+	return bp.CompleteBackup(ctx, &m)
+}
+
+func ProcessListBackups(ctx context.Context, location string, creds *Credentials) (
+	[]*Manifest, error) {
+
+	manifests, err := ListBackupManifests(location, creds)
+	if err != nil {
+		return nil, errors.Wrapf(err, "cannot read manfiests at location %s", location)
 	}
 
-	bp := &BackupProcessor{Request: req}
-	return bp.CompleteBackup(ctx, &m)
+	res := make([]*Manifest, 0)
+	for _, m := range manifests {
+		res = append(res, m)
+	}
+	sort.Slice(res, func(i, j int) bool { return res[i].Path < res[j].Path })
+	return res, nil
 }

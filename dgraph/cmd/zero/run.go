@@ -93,7 +93,7 @@ instances to achieve high-availability.
 	flag.Bool("enable_sentry", true, "Turn on/off sending events to Sentry. (default on)")
 
 	// OpenCensus flags.
-	flag.Float64("trace", 1.0, "The ratio of queries to trace.")
+	flag.Float64("trace", 0.01, "The ratio of queries to trace.")
 	flag.String("jaeger.collector", "", "Send opencensus traces to Jaeger.")
 	// See https://github.com/DataDog/opencensus-go-exporter-datadog/issues/34
 	// about the status of supporting annotation logs through the datadog exporter
@@ -188,6 +188,10 @@ func run() {
 		LudicrousMode: Zero.Conf.GetBool("ludicrous_mode"),
 	}
 
+	if !enc.EeBuild && Zero.Conf.GetString("enterprise_license") != "" {
+		log.Fatalf("ERROR: enterprise_license option cannot be applied to OSS builds. ")
+	}
+
 	if opts.numReplicas < 0 || opts.numReplicas%2 == 0 {
 		log.Fatalf("ERROR: Number of replicas must be odd for consensus. Found: %d",
 			opts.numReplicas)
@@ -199,6 +203,12 @@ func run() {
 			return true, true
 		}
 	}
+
+	if opts.rebalanceInterval <= 0 {
+		log.Fatalf("ERROR: Rebalance interval must be greater than zero. Found: %d",
+			opts.rebalanceInterval)
+	}
+
 	grpc.EnableTracing = false
 	otrace.ApplyConfig(otrace.Config{
 		DefaultSampler: otrace.ProbabilitySampler(Zero.Conf.GetFloat64("trace"))})
@@ -207,7 +217,7 @@ func run() {
 	if opts.bindall {
 		addr = "0.0.0.0"
 	}
-	if len(opts.myAddr) == 0 {
+	if opts.myAddr == "" {
 		opts.myAddr = fmt.Sprintf("localhost:%d", x.PortZeroGrpc+opts.portOffset)
 	}
 
@@ -231,22 +241,12 @@ func run() {
 	go x.RunVlogGC(kv, gcCloser)
 	defer gcCloser.SignalAndWait()
 
-	// zero out from memory
-	kvOpt.EncryptionKey = nil
-
 	store := raftwal.Init(kv, opts.nodeId, 0)
 
 	// Initialize the servers.
 	var st state
 	st.serveGRPC(grpcListener, store)
 	st.serveHTTP(httpListener)
-
-	// Apply enterprise license if one was given.
-	if license := Zero.Conf.GetString("enterprise_license"); len(license) > 0 {
-		if err := st.applyLicenseFile(license); err != nil {
-			glog.Warningf("Cannot apply enterprise license file %s", license)
-		}
-	}
 
 	http.HandleFunc("/health", st.pingResponse)
 	http.HandleFunc("/state", st.getState)
@@ -297,11 +297,12 @@ func run() {
 		_ = httpListener.Close()
 		// Stop Raft.
 		st.node.closer.SignalAndWait()
+		// Try to generate a snapshot before the shutdown.
+		st.node.trySnapshot(0)
 		// Stop Raft store.
 		store.Closer.SignalAndWait()
 		// Stop all internal requests.
 		_ = grpcListener.Close()
-		st.node.trySnapshot(0)
 	}()
 
 	glog.Infoln("Running Dgraph Zero...")

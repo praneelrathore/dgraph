@@ -92,6 +92,9 @@ func (w *DiskStorage) processIndexRange() {
 	defer w.Closer.Done()
 
 	processSingleRange := func(r indexRange) {
+		if r.from == r.until {
+			return
+		}
 		batch := w.db.NewWriteBatch()
 		if err := w.deleteRange(batch, r.from, r.until); err != nil {
 			glog.Errorf("deleteRange failed with error: %v, from: %d, until: %d\n",
@@ -145,7 +148,7 @@ func RaftId(db *badger.DB) (uint64, error) {
 func (w *DiskStorage) snapshotKey() []byte {
 	b := make([]byte, 14)
 	binary.BigEndian.PutUint64(b[0:8], w.id)
-	copy(b[8:10], []byte("ss"))
+	copy(b[8:10], "ss")
 	binary.BigEndian.PutUint32(b[10:14], w.gid)
 	return b
 }
@@ -154,7 +157,7 @@ func (w *DiskStorage) snapshotKey() []byte {
 func (w *DiskStorage) HardStateKey() []byte {
 	b := make([]byte, 14)
 	binary.BigEndian.PutUint64(b[0:8], w.id)
-	copy(b[8:10], []byte("hs"))
+	copy(b[8:10], "hs")
 	binary.BigEndian.PutUint32(b[10:14], w.gid)
 	return b
 }
@@ -163,7 +166,7 @@ func (w *DiskStorage) HardStateKey() []byte {
 func (w *DiskStorage) CheckpointKey() []byte {
 	b := make([]byte, 14)
 	binary.BigEndian.PutUint64(b[0:8], w.id)
-	copy(b[8:10], []byte("ck"))
+	copy(b[8:10], "ck")
 	binary.BigEndian.PutUint32(b[10:14], w.gid)
 	return b
 }

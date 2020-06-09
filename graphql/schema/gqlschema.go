@@ -34,13 +34,20 @@ const (
 	searchDirective = "search"
 	searchArgs      = "by"
 
-	dgraphDirective = "dgraph"
-	dgraphTypeArg   = "type"
-	dgraphPredArg   = "pred"
-	idDirective     = "id"
-	secretDirective = "secret"
-	customDirective = "custom"
-	remoteDirective = "remote" // types with this directive are not stored in Dgraph.
+	dgraphDirective  = "dgraph"
+	dgraphTypeArg    = "type"
+	dgraphPredArg    = "pred"
+	idDirective      = "id"
+	secretDirective  = "secret"
+	authDirective    = "auth"
+	customDirective  = "custom"
+	remoteDirective  = "remote" // types with this directive are not stored in Dgraph.
+	cascadeDirective = "cascade"
+
+	// custom directive args and fields
+	mode   = "mode"
+	BATCH  = "BATCH"
+	SINGLE = "SINGLE"
 
 	deprecatedDirective = "deprecated"
 	NumUid              = "numUids"
@@ -69,6 +76,13 @@ enum DgraphIndex {
 	hour
 }
 
+input AuthRule {
+	and: [AuthRule]
+	or: [AuthRule]
+	not: AuthRule
+	rule: String
+}
+
 enum HTTPMethod {
 	GET
 	POST
@@ -77,15 +91,20 @@ enum HTTPMethod {
 	DELETE
 }
 
+enum Mode {
+	BATCH
+	SINGLE
+}
+
 input CustomHTTP {
 	url: String!
 	method: HTTPMethod!
-	body: String!
+	body: String
+	graphql: String
+	mode: Mode
 	forwardHeaders: [String!]
-}
-
-input CustomGraphQL {
-	query: String!
+	secretHeaders: [String!]
+	skipIntrospection: Boolean
 }
 
 directive @hasInverse(field: String!) on FIELD_DEFINITION
@@ -93,9 +112,14 @@ directive @search(by: [DgraphIndex!]) on FIELD_DEFINITION
 directive @dgraph(type: String, pred: String) on OBJECT | INTERFACE | FIELD_DEFINITION
 directive @id on FIELD_DEFINITION
 directive @secret(field: String!, pred: String) on OBJECT | INTERFACE
-directive @custom(http: CustomHTTP, graphql: CustomGraphQL) on FIELD_DEFINITION
+directive @auth(
+	query: AuthRule,
+	add: AuthRule,
+	update: AuthRule,
+	delete:AuthRule) on OBJECT
+directive @custom(http: CustomHTTP) on FIELD_DEFINITION
 directive @remote on OBJECT | INTERFACE
-
+directive @cascade on FIELD
 
 input IntFilter {
 	eq: Int
@@ -165,7 +189,8 @@ type directiveValidator func(
 	sch *ast.Schema,
 	typ *ast.Definition,
 	field *ast.FieldDefinition,
-	dir *ast.Directive) *gqlerror.Error
+	dir *ast.Directive,
+	secrets map[string]x.SensitiveByteSlice) *gqlerror.Error
 
 type searchTypeIndex struct {
 	gqlType string
@@ -203,6 +228,15 @@ var defaultSearches = map[string]string{
 	"Float":    "float",
 	"String":   "term",
 	"DateTime": "year",
+}
+
+// graphqlSpecScalars holds all the scalar types supported by the graphql spec.
+var graphqlSpecScalars = map[string]bool{
+	"Int":     true,
+	"Float":   true,
+	"String":  true,
+	"Boolean": true,
+	"ID":      true,
 }
 
 // Dgraph index filters that have contains intersecting filter
@@ -267,7 +301,17 @@ var directiveValidators = map[string]directiveValidator{
 		sch *ast.Schema,
 		typ *ast.Definition,
 		field *ast.FieldDefinition,
-		dir *ast.Directive) *gqlerror.Error {
+		dir *ast.Directive,
+		secrets map[string]x.SensitiveByteSlice) *gqlerror.Error {
+		return nil
+	},
+	// Just go get it printed into generated schema
+	authDirective: func(
+		sch *ast.Schema,
+		typ *ast.Definition,
+		field *ast.FieldDefinition,
+		dir *ast.Directive,
+		secrets map[string]x.SensitiveByteSlice) *gqlerror.Error {
 		return nil
 	},
 }
@@ -364,7 +408,8 @@ func preGQLValidation(schema *ast.SchemaDocument) gqlerror.List {
 // are easier to run once we know that the schema is GraphQL valid and that validation
 // has fleshed out the schema structure; we just need to check if it also satisfies
 // the extra rules.
-func postGQLValidation(schema *ast.Schema, definitions []string) gqlerror.List {
+func postGQLValidation(schema *ast.Schema, definitions []string,
+	secrets map[string]x.SensitiveByteSlice) gqlerror.List {
 	var errs []*gqlerror.Error
 
 	for _, defn := range definitions {
@@ -380,7 +425,7 @@ func postGQLValidation(schema *ast.Schema, definitions []string) gqlerror.List {
 					continue
 				}
 				errs = appendIfNotNull(errs,
-					directiveValidators[dir.Name](schema, typ, field, dir))
+					directiveValidators[dir.Name](schema, typ, field, dir, secrets))
 			}
 		}
 	}
@@ -797,12 +842,12 @@ func hasOrderables(defn *ast.Definition) bool {
 
 func hasID(defn *ast.Definition) bool {
 	return fieldAny(defn.Fields,
-		func(fld *ast.FieldDefinition) bool { return isID(fld) })
+		isID)
 }
 
 func hasXID(defn *ast.Definition) bool {
 	return fieldAny(defn.Fields,
-		func(fld *ast.FieldDefinition) bool { return hasIDDirective(fld) })
+		hasIDDirective)
 }
 
 // fieldAny returns true if any field in fields satisfies pred
@@ -926,7 +971,7 @@ func addTypeOrderable(schema *ast.Schema, defn *ast.Definition) {
 
 func addAddPayloadType(schema *ast.Schema, defn *ast.Definition) {
 	qry := &ast.FieldDefinition{
-		Name: strings.ToLower(defn.Name),
+		Name: camelCase(defn.Name),
 		Type: ast.ListType(&ast.Type{
 			NamedType: defn.Name,
 		}, nil),
@@ -956,7 +1001,7 @@ func addUpdatePayloadType(schema *ast.Schema, defn *ast.Definition) {
 	}
 
 	qry := &ast.FieldDefinition{
-		Name: strings.ToLower(defn.Name),
+		Name: camelCase(defn.Name),
 		Type: &ast.Type{
 			Elem: &ast.Type{
 				NamedType: defn.Name,
@@ -1556,7 +1601,8 @@ func Stringify(schema *ast.Schema, originalTypes []string) string {
 			"#######################\n# Generated Mutations\n#######################\n\n"))
 		x.Check2(sch.WriteString(generateObjectString(schema.Mutation) + "\n"))
 	}
-	if len(schema.Subscription.Fields) > 0 {
+
+	if schema.Subscription != nil && len(schema.Subscription.Fields) > 0 {
 		x.Check2(sch.WriteString(
 			"#######################\n# Generated Subscriptions\n#######################\n\n"))
 		x.Check2(sch.WriteString(generateObjectString(schema.Subscription)))
@@ -1588,4 +1634,17 @@ func appendIfNotNull(errs []*gqlerror.Error, err *gqlerror.Error) gqlerror.List 
 	}
 
 	return errs
+}
+
+func isGraphqlSpecScalar(typ string) bool {
+	_, ok := graphqlSpecScalars[typ]
+	return ok
+}
+
+func camelCase(x string) string {
+	if x == "" {
+		return ""
+	}
+
+	return strings.ToLower(x[:1]) + x[1:]
 }

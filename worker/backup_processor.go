@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"sync"
 
 	"github.com/dgraph-io/badger/v2"
 	bpb "github.com/dgraph-io/badger/v2/pb"
@@ -34,12 +33,40 @@ import (
 	"github.com/dgraph-io/dgraph/x"
 )
 
+const (
+	// backupNumGo is the number of go routines used by the backup stream writer.
+	backupNumGo = 16
+)
+
 // BackupProcessor handles the different stages of the backup process.
 type BackupProcessor struct {
 	// DB is the Badger pstore managed by this node.
 	DB *badger.DB
 	// Request stores the backup request containing the parameters for this backup.
 	Request *pb.BackupRequest
+
+	// plList is an array of pre-allocated pb.PostingList objects.
+	plList []*pb.PostingList
+	// bplList is an array of pre-allocated pb.BackupPostingList objects.
+	bplList []*pb.BackupPostingList
+}
+
+func NewBackupProcessor(db *badger.DB, req *pb.BackupRequest) *BackupProcessor {
+	bp := &BackupProcessor{
+		DB:      db,
+		Request: req,
+		plList:  make([]*pb.PostingList, backupNumGo),
+		bplList: make([]*pb.BackupPostingList, backupNumGo),
+	}
+
+	for i := range bp.plList {
+		bp.plList[i] = &pb.PostingList{}
+	}
+	for i := range bp.bplList {
+		bp.bplList[i] = &pb.BackupPostingList{}
+	}
+
+	return bp
 }
 
 // LoadResult holds the output of a Load operation.
@@ -51,48 +78,6 @@ type LoadResult struct {
 	MaxLeaseUid uint64
 	// The error, if any, of the load operation.
 	Err error
-}
-
-// Manifest records backup details, these are values used during restore.
-// Since is the timestamp from which the next incremental backup should start (it's set
-// to the readTs of the current backup).
-// Groups are the IDs of the groups involved.
-type Manifest struct {
-	sync.Mutex
-	//Type is the type of backup, either full or incremental.
-	Type string `json:"type"`
-	// Since is the timestamp at which this backup was taken. It's called Since
-	// because it will become the timestamp from which to backup in the next
-	// incremental backup.
-	Since uint64 `json:"since"`
-	// Groups is the map of valid groups to predicates at the time the backup was created.
-	Groups map[uint32][]string `json:"groups"`
-	// BackupId is a unique ID assigned to all the backups in the same series
-	// (from the first full backup to the last incremental backup).
-	BackupId string `json:"backup_id"`
-	// BackupNum is a monotonically increasing number assigned to each backup in
-	// a series. The full backup as BackupNum equal to one and each incremental
-	// backup gets assigned the next available number. Used to verify the integrity
-	// of the data during a restore.
-	BackupNum uint64 `json:"backup_num"`
-	// Path is the path to the manifest file. This field is only used during
-	// processing and is not written to disk.
-	Path string `json:"-"`
-	// Encrypted indicates whether this backup was encrypted or not.
-	Encrypted bool `json:"encrypted"`
-}
-
-func (m *Manifest) getPredsInGroup(gid uint32) predicateSet {
-	preds, ok := m.Groups[gid]
-	if !ok {
-		return nil
-	}
-
-	predSet := make(predicateSet)
-	for _, pred := range preds {
-		predSet[pred] = struct{}{}
-	}
-	return predSet
 }
 
 // WriteBackup uses the request values to create a stream writer then hand off the data
@@ -129,7 +114,7 @@ func (pr *BackupProcessor) WriteBackup(ctx context.Context) (*pb.Status, error) 
 
 	var maxVersion uint64
 
-	newhandler, err := enc.GetWriter(Config.BadgerKeyFile, handler)
+	newhandler, err := enc.GetWriter(x.WorkerConfig.EncryptionKey, handler)
 	if err != nil {
 		return &emptyRes, err
 	}
@@ -137,6 +122,7 @@ func (pr *BackupProcessor) WriteBackup(ctx context.Context) (*pb.Status, error) 
 
 	stream := pr.DB.NewStreamAt(pr.Request.ReadTs)
 	stream.LogPrefix = "Dgraph.Backup"
+	stream.NumGo = backupNumGo
 	stream.KeyToList = pr.toBackupList
 	stream.ChooseKey = func(item *badger.Item) bool {
 		parsedKey, err := x.Parse(item.Key())
@@ -230,7 +216,8 @@ func (m *Manifest) GoString() string {
 		m.Since, m.Groups, m.Encrypted)
 }
 
-func (pr *BackupProcessor) toBackupList(key []byte, itr *badger.Iterator) (*bpb.KVList, error) {
+func (pr *BackupProcessor) toBackupList(key []byte, itr *badger.Iterator) (
+	*bpb.KVList, error) {
 	list := &bpb.KVList{}
 
 	item := itr.Item()
@@ -261,7 +248,7 @@ func (pr *BackupProcessor) toBackupList(key []byte, itr *badger.Iterator) (*bpb.
 		}
 		kv.Key = backupKey
 
-		backupPl, err := toBackupPostingList(kv.Value)
+		backupPl, err := pr.toBackupPostingList(kv.Value, itr.ThreadId)
 		if err != nil {
 			return nil, err
 		}
@@ -305,12 +292,18 @@ func toBackupKey(key []byte) ([]byte, error) {
 	return backupKey, nil
 }
 
-func toBackupPostingList(val []byte) ([]byte, error) {
-	pl := &pb.PostingList{}
+func (pr *BackupProcessor) toBackupPostingList(val []byte, threadNum int) ([]byte, error) {
+	pl := pr.plList[threadNum]
+	bpl := pr.bplList[threadNum]
+	pl.Reset()
+	bpl.Reset()
+
 	if err := pl.Unmarshal(val); err != nil {
 		return nil, errors.Wrapf(err, "while reading posting list")
 	}
-	backupVal, err := posting.ToBackupPostingList(pl).Marshal()
+	posting.ToBackupPostingList(pl, bpl)
+	backupVal, err := bpl.Marshal()
+
 	if err != nil {
 		return nil, errors.Wrapf(err, "while converting posting list for backup")
 	}

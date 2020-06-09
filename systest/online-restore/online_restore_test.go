@@ -38,7 +38,7 @@ import (
 func sendRestoreRequest(t *testing.T) {
 	restoreRequest := `mutation restore() {
 		 restore(input: {location: "/data/backup", backupId: "heuristic_sammet9",
-			keyFile: "/data/keys/enc_key"}) {
+		 	encryptionKeyFile: "/data/keys/enc_key"}) {
 			response {
 				code
 				message
@@ -72,7 +72,7 @@ func runQueries(t *testing.T, dg *dgo.Dgraph) {
 			continue
 		}
 		filename := path.Join(queryDir, file.Name())
-		reader, cleanup := chunker.FileReader(filename, "")
+		reader, cleanup := chunker.FileReader(filename, nil)
 		bytes, err := ioutil.ReadAll(reader)
 		require.NoError(t, err)
 		contents := string(bytes)
@@ -140,7 +140,7 @@ func TestBasicRestore(t *testing.T) {
 func TestInvalidBackupId(t *testing.T) {
 	restoreRequest := `mutation restore() {
 		 restore(input: {location: "/data/backup", backupId: "bad-backup-id",
-			keyFile: "/data/keys/enc_key"}) {
+			encryptionKeyFile: "/data/keys/enc_key"}) {
 			response {
 				code
 				message
@@ -160,4 +160,38 @@ func TestInvalidBackupId(t *testing.T) {
 	buf, err := ioutil.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.Contains(t, string(buf), "failed to verify backup")
+}
+
+func TestListBackups(t *testing.T) {
+	query := `query backup() {
+		listBackups(input: {location: "/data/backup"}) {
+			backupId
+			backupNum
+			encrypted
+			groups {
+				groupId
+				predicates    
+			}
+			path
+			since
+			type
+		}
+	}`
+
+	adminUrl := "http://localhost:8180/admin"
+	params := testutil.GraphQLParams{
+		Query: query,
+	}
+	b, err := json.Marshal(params)
+	require.NoError(t, err)
+
+	resp, err := http.Post(adminUrl, "application/json", bytes.NewBuffer(b))
+	require.NoError(t, err)
+	buf, err := ioutil.ReadAll(resp.Body)
+	require.NoError(t, err)
+	sbuf := string(buf)
+	require.Contains(t, sbuf, `"backupId":"heuristic_sammet9"`)
+	require.Contains(t, sbuf, `"backupNum":1`)
+	require.Contains(t, sbuf, `"backupNum":2`)
+	require.Contains(t, sbuf, "initial_release_date")
 }
